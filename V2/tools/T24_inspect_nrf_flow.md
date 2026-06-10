@@ -62,6 +62,8 @@ class InspectNRFFlowRequest(BaseModel):
 class NRFInspectionResult(BaseModel):
     schema_version: Literal["2.0"]
     request_id: UUID
+    analysis_id: UUID
+    initial_packet_id: UUID
     attempt_id: UUID
     status: Literal["completed", "empty", "partial", "failed"]
     effective_window: FrameWindow
@@ -76,6 +78,8 @@ class NRFInspectionResult(BaseModel):
     revision: str
 ```
 
+`analysis_id`, `initial_packet_id`, `attempt_id` and `request_id` are copied from the validated request and are immutable lineage fields. A result missing or mismatching any field cannot enter dependency-expanded T12/T14/T15 processing.
+
 ## 5. Pre-Execution Request Validation
 
 ### Attempt and pass
@@ -83,6 +87,8 @@ class NRFInspectionResult(BaseModel):
 - Attempt matches initial packet/current diagnosis target.
 - Request originated from initial T16 result.
 - Final-pass/replayed request is rejected.
+
+The published result copies request lineage fields exactly and includes them in its revision. `completed`, `empty` and `partial` are terminal evidence outcomes eligible for later admission after integrity validation. `failed` is terminal for orchestration/reporting but is never an expanded deterministic evidence input.
 
 ### Evidence rationale
 
@@ -366,12 +372,14 @@ V2/harness/storage/
 - Missing initial evidence, wrong attempt/packet, invalid reason.
 - Wildcard/capture-wide/final-pass/replayed/duplicate request.
 - Window clamp and per-attempt request limit.
+- Result copies analysis/attempt/initial-packet/request lineage exactly and includes it in revision hashing.
 
 ### 26.2 Analysis tests
 
 - No-instance discovery caused by failed registration.
 - Cleanup 404 recovered before call.
 - Required service suspended.
+- Empty and partial outcomes remain publishable terminal results; failed/publication outcomes are not admitted to expanded processing.
 - Stale endpoint returned/selected.
 - Alternate healthy candidate.
 - Delegated discovery success/failure/partial visibility.
@@ -399,3 +407,4 @@ T24 is complete when:
 6. One justified bounded expansion is the maximum.
 7. Full NRF data remains local and model summaries are masked/minimal.
 8. Requests/results/access are immutable and auditable.
+9. Result lineage identifies the exact analysis, attempt, initial packet and approved request.

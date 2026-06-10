@@ -29,7 +29,7 @@ Initial inputs:
 - T14 scenario validation.
 - Bounded exact evidence records resolved through T18.
 
-Expanded inputs add only completed T24/T25 `DependencyInspectionResult` objects. T15 never receives NRF/UDR readers.
+Expanded inputs add admitted T24/T25 `DependencyInspectionResult` objects, the dependency-expanded T12 result, and the latest applicable T14 revision. Admitted means published status `completed`, `empty` or `partial` with validated lineage/integrity. T15 never receives NRF/UDR readers.
 
 ## 4. Python Tool Contracts
 
@@ -46,6 +46,8 @@ class BuildInitialEvidenceRequest(BaseModel):
 class BuildExpandedEvidenceRequest(BaseModel):
     initial_packet: EvidencePacket
     dependency_results: list[DependencyInspectionResult]
+    expanded_root_cause: RootCauseResult
+    scenario_validation: ValidateScenarioResult | None
     final_model_context_limit: int
 
 
@@ -81,6 +83,10 @@ class EvidencePacket(BaseModel):
     dependency_evidence: list[DependencyInspectionEvidence]
     deterministic_limitations: list[str]
     warnings: list[str]
+    parent_packet_id: UUID | None
+    root_cause_revision: str
+    scenario_validation_revision: str | None
+    dependency_result_revisions: list[str]
 ```
 
 ## 6. Initial Versus Expanded Invariants
@@ -88,6 +94,10 @@ class EvidencePacket(BaseModel):
 ### Initial packet
 
 - `pass_stage=initial`.
+- `parent_packet_id=None`.
+- `root_cause_revision` identifies the immutable primary T12 result.
+- `scenario_validation_revision` identifies the primary T14 result when a scenario exists.
+- `dependency_result_revisions=[]`.
 - `dependency_evidence=[]`.
 - No detailed NRF/UDR transaction, status, frame, lifecycle, or failure summary.
 - May state only that NRF/UDR inspection tools exist and include primary-flow suspicions/target hints.
@@ -96,8 +106,13 @@ class EvidencePacket(BaseModel):
 
 - Derived from the exact initial packet ID.
 - Includes only validated T24/T25 result summaries/evidence.
+- Requires a dependency-expanded T12 result whose parent is the initial packet's primary ranking revision and whose consumed dependency revisions exactly equal the admitted result set.
+- Uses the latest applicable T14 revision. This may remain the primary revision when no checkpoint consumes dependency evidence. When dependency checkpoints were revalidated, the supplied revision must descend from the primary scenario revision and consume the same applicable result revisions.
+- Filters run-level scenario checkpoint content to the selected attempt while retaining the run-level validation revision for lineage.
+- Replaces model-visible primary/alternative/downstream/scenario sections with the revised deterministic values; it does not merely append dependency evidence to stale initial conclusions.
 - Does not add unrelated hidden events.
 - Marks tool request, validation, query scope, and result revision.
+- Sets `parent_packet_id` to the initial packet, records all deterministic input revisions, and receives a new packet ID.
 
 Packet validation rejects invariant violations.
 
@@ -266,6 +281,8 @@ No hidden counts, failure hints, or flow summaries are leaked through the descri
 
 Packet ID UUIDv5 includes input revision hashes, pass stage, provider privacy mode, schema-guide version, and token-budget configuration.
 
+For an expanded packet, input revisions include the parent packet ID, expanded T12 revision, applicable T14 revision and sorted dependency-result revisions. Rebuilding with the same logical inputs in a different completion order must produce the same packet ID.
+
 ```text
 evidence/packets/
   <packet-id>.json
@@ -295,6 +312,8 @@ Invalid packet never reaches T16.
 - Mandatory content exceeds budget: fail with `EVIDENCE_BUDGET_EXCEEDED` and detailed block sizes.
 - Masking failure: fatal for remote provider.
 - Dependency result belongs to another attempt/packet: reject.
+- Expanded T12/T14 lineage does not match the initial packet or admitted dependency revisions: reject.
+- Failed, unpublished, duplicate, stale or integrity-invalid inspection result: reject.
 - Hidden NRF/UDR detail in initial packet: fatal invariant violation.
 - Publication failure: fatal.
 
@@ -369,6 +388,9 @@ V2/harness/schemas/
 - Initial packet rejects NRF/UDR transaction/detail/frame leakage.
 - Tool descriptor contains no hidden hints.
 - Expanded packet accepts only matching validated inspection results.
+- Expanded packet cannot be built before dependency-expanded T12 and applicable T14 revisions exist.
+- Expanded packet renders revised ranking/checkpoint values, not stale initial values.
+- Reordered NRF/UDR result arrival produces the same packet ID/content.
 - Unrelated dependency records rejected.
 - Final packet remains within budget.
 
@@ -388,6 +410,7 @@ T15 is complete when:
 2. Initial packets contain no detailed NRF/UDR evidence.
 3. Expanded packets contain only approved bounded inspection results.
 4. Every model-visible conclusion/evidence reference resolves locally.
+5. Expanded packets cryptographically identify their parent packet and exact revised deterministic/dependency inputs.
 5. Mandatory primary evidence survives trimming.
 6. Packets fit model-specific budgets with recorded truncations.
 7. Remote masking prevents sensitive-data leakage while preserving correlation aliases.

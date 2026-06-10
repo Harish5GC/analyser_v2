@@ -1002,8 +1002,13 @@ The scenario parser prompt must explicitly return `null` for unspecified values.
 ```python
 class EvidencePacket(BaseModel):
     schema_version: Literal["2.0"]
+    packet_id: UUID
     pass_stage: Literal["initial", "dependency_expanded"]
     analysis_id: UUID
+    parent_packet_id: UUID | None
+    root_cause_revision: str
+    scenario_validation_revision: str | None
+    dependency_result_revisions: list[str]
     ue: MaskedUEIdentity
     ue_request: UERequest
     attempt: AttemptSummary
@@ -1027,7 +1032,7 @@ Token budgeting order:
 5. Baseline details are reduced to first divergence.
 6. Bodies are shortened before any mandatory evidence is removed.
 
-The initial packet cannot contain detailed NRF or UDR events. A dependency-expanded packet may contain only validated outputs from `inspect_nrf_flow` or `inspect_udr_flow`. The final packet must still satisfy the configured token budget.
+The initial packet cannot contain detailed NRF or UDR events and sets `parent_packet_id=None` with no dependency revisions. A dependency-expanded packet names the exact initial parent packet and may contain only admitted outputs from `inspect_nrf_flow` or `inspect_udr_flow`; its ranking/scenario/dependency revisions must match the section 19.3 lineage. The final packet must still satisfy the configured token budget.
 
 ### 15.1 Lazy dependency inspectors
 
@@ -1140,83 +1145,344 @@ class AnalysisReport(BaseModel):
 
 `UEResult` contains all attempts. Each failed attempt contains deterministic root cause, model diagnosis when available, timeline and evidence.
 
-## 19. Orchestrator Pseudocode
+## 19. Orchestration Contract
+
+### 19.1 Invariants
+
+- T01-T04 are run-scoped hard dependencies. T05-T12 are deterministic per-attempt processing; T13/T14, T15/T16 and T18-T25 retain their documented gates.
+- T06, T07 and T08 may execute concurrently for one attempt. T09 starts only after all three explicit-detector results for that attempt are available.
+- Candidate, timeline, comparison, ranking, diagnosis and dependency-result maps are keyed by `attempt_id`. Cross-attempt candidate accumulation is forbidden.
+- Primary code receives only `PrimaryEventReader`. `DependencyToolExecutor` is the only runtime object owning NRF/UDR reader factories.
+- T10 primary timelines exist before T11 comparison and before T15 model-packet construction. T05 request extraction exists before T11, T14 and T15.
+- T18-T20 are called only through bounded, capability-checked evidence requests. They are not unconditional pipeline stages and their artifacts never mutate T01/T02 evidence.
+- Every executed tool result is persisted before the run manifest records that invocation as complete. Optional skipped tools are recorded according to run-manifest policy without converting deterministic success into failure.
+- T17 runs even when scenario parsing, provider invocation or dependency inspection is disabled or fails.
+
+### 19.2 Runtime placement
+
+| Tools | Scope | Required predecessor | Gate |
+|---|---|---|---|
+| T01 -> T02 -> T03 -> T04 -> T21 | Run | Previous tool in chain | Mandatory after successful run setup; partial results follow each tool's contract. |
+| T13 | Run/request | Validated input | Scenario text supplied. It may run independently of the capture chain. |
+| T05 | Attempt | T04 | Every persisted attempt. |
+| T06/T07/T08 | Attempt | T04, T21 and detection context | Every persisted attempt; explicit detectors may run concurrently. |
+| T09 | Attempt | T06/T07/T08 for same attempt | Every persisted attempt. |
+| T10 primary | Attempt | T05-T09 | Every persisted attempt. |
+| T11 | Attempt | T05, T10 and eligible successful attempts | Failed/incomplete diagnostic target. No baseline is a valid result. |
+| T12 primary | Attempt | T06-T09 and optional T11 | Failed/incomplete diagnostic target. |
+| T14 primary | Scenario/run | T13, T04, T05 and T09 | Valid scenario exists. |
+| T15/T16 initial | Attempt | T05, T10-T12 and optional T14 | Provider enabled and attempt selected for model narration. |
+| T24/T25 | Attempt/request | Schema-valid initial T16 request | Approved bounded dependency request. |
+| T22 | Internal T24 | Approved NRF request | Invoked only by `NRFInspector`. |
+| T23 | Internal T24/T25 | Retrieved bounded dependency evidence | Invoked only inside the selected inspector. |
+| T12/T14 dependency-expanded | Attempt/scenario | Completed T24/T25 results | Dependency results affect ranking or scenario checkpoints. |
+| T15/T16 final | Attempt | Expanded deterministic results | At least one completed dependency result; exactly one final pass. |
+| T18/T19/T20 | On demand | Capability and bounded selector/query | Validated evidence need; T20 only when retained detail is insufficient. |
+| T17 | Run | Completed deterministic stages and any optional outcomes | Mandatory final publication. |
+
+### 19.3 Dependency-expanded commit contract
+
+For each selected attempt, the orchestrator creates an `ExpansionInputSet` only after every approved T24/T25 request for that attempt terminates:
+
+```python
+class ExpansionInputSet(BaseModel):
+    analysis_id: UUID
+    attempt_id: UUID
+    initial_packet_id: UUID
+    primary_ranking_revision: str
+    primary_scenario_revision: str | None
+    admitted_results: list[DependencyInspectionResult]
+    rejected_or_failed_request_ids: list[UUID]
+```
+
+An inspection result is admitted only when:
+
+- status is `completed`, `empty` or `partial`;
+- `analysis_id`, `attempt_id`, request ID and initial packet ID match approved run state;
+- its revision and referenced evidence pass integrity validation;
+- it was produced from an initial-pass request and has not already been consumed by another expansion generation.
+
+The admitted result set is sorted by dependency type then request ID before hashing and execution. Empty results are meaningful inspected outcomes: they can preserve the primary ranking while adding limitations or resolve a scenario's "not inspected" state. Failed, unpublished or integrity-invalid results never enter deterministic evidence/ranking inputs.
+
+Processing order is strict:
+
+1. T12 consumes the primary ranking lineage plus all admitted results for the attempt and publishes a new dependency-expanded ranking revision.
+2. T14 reruns only when the scenario contains checkpoints that can consume an admitted dependency result. It preserves unaffected checkpoint IDs/status/evidence and publishes one run-level dependency-expanded validation after all selected attempts' inspections settle.
+3. T15 verifies that the initial packet, expanded T12 revision, latest applicable T14 revision and admitted inspection revisions form one lineage. It then creates a new packet; it never patches the initial packet in place.
+4. T16 verifies `pass_stage=final` against `packet.pass_stage=dependency_expanded`, then performs exactly one final call. Candidate/evidence references are validated against the expanded packet and revised deterministic artifacts.
+5. T17 receives both primary and expanded generations plus inspection outcomes, including failed/invalid requests that were excluded from expansion.
+
+If `admitted_results` is empty, steps 1-4 are skipped. The initial T12/T14/T16 artifacts remain authoritative and T17 records why expansion did not occur.
+
+### 19.4 Pseudocode
 
 ```python
 def analyze(request: AnalysisRequest) -> AnalysisReport:
     run = run_store.create(request)
+    manifest = run_manifest.start(run, request)
     retained_pcap = run_store.retain_source(request.pcap_path, run.source_dir)
-    decoder_result = decoder_runner.decode(
-        DecodeCaptureRequest(
-            analysis_id=run.analysis_id,
-            retained_pcap_path=retained_pcap,
-            run_dir=run.path,
-            decoder_binary=config.decoder_binary,
-            timeout_seconds=config.decoder_timeout_seconds,
+
+    scenario_parse = None
+    if request.scenario:
+        scenario_parse = execute_and_publish(
+            manifest, "T13", lambda: scenario_parser.parse(request.scenario)
         )
+
+    decoder_result = execute_and_publish(
+        manifest,
+        "T01",
+        lambda: decoder_runner.decode(retained_pcap, run, request.config),
+    )
+    normalization = execute_and_publish(
+        manifest, "T02", lambda: normalizer.normalize(decoder_result, run)
     )
 
-    event_writer = PartitionedJsonlEventStore(run.normalized_dir)
-    for normalizer, source in decoder_sources(decoder_result):
-        for event in normalizer.iter_events(source):
-            event_writer.append(partition_router.route(event))
-    event_writer.finalize()
-
-    primary_reader = event_store_factory.open_primary_reader(run.normalized_dir)
+    primary_reader = event_store_factory.open_primary_reader(normalization)
     dependency_executor = dependency_tool_factory.create_executor(
-        normalized_dir=run.normalized_dir,
+        normalization=normalization,
         evidence_repository=evidence_repository,
         config=run.config,
     )
 
-    identities = identity_graph.build(primary_reader)
-    attempts = attempt_engine.segment(primary_reader, identities)
-    phases = phase_classifier.classify(primary_reader, attempts)
-
-    failures = []
-    comparisons = {}
-    roots = {}
-    for attempt in attempts:
-        events = primary_reader.for_attempt(attempt.attempt_id)
-        failures.extend(detector_registry.detect(attempt, events))
-        if attempt.outcome != "succeeded":
-            comparisons[attempt.attempt_id] = comparator.compare(attempt, attempts)
-            roots[attempt.attempt_id] = ranker.rank(
-                attempt, failures, comparisons[attempt.attempt_id]
-            )
-
-    scenario_spec = scenario_parser.parse(request.scenario) if request.scenario else None
-    scenario_results = scenario_validator.validate(
-        scenario_spec, attempts, primary_reader
+    identities = execute_and_publish(
+        manifest, "T03", lambda: identity_graph.build(primary_reader)
+    )
+    segmented = execute_and_publish(
+        manifest,
+        "T04",
+        lambda: attempt_engine.segment(primary_reader, identities),
+    )
+    attempts = segmented.attempts
+    phases = execute_and_publish(
+        manifest,
+        "T21",
+        lambda: phase_classifier.classify(primary_reader, attempts),
     )
 
-    diagnoses = {}
-    for failed_attempt in selected_failed_attempts(attempts, request):
-        packet = initial_evidence_builder.build(
-            failed_attempt, roots, comparisons, scenario_results
+    request_results = {}
+    explicit_results = {}
+    missing_results = {}
+    timelines = {}
+    comparisons = {}
+    primary_roots = {}
+
+    for attempt in attempts:
+        attempt_id = attempt.attempt_id
+        events = primary_reader.for_attempt(attempt_id)
+        context = detection_context_factory.create(
+            attempt=attempt,
+            phases=phases,
+            capture=normalization.capture_metadata,
+            visibility=attempt.visibility,
+            policies=run.resolved_policies,
         )
-        if provider.enabled:
-            initial = provider.generate_diagnosis(packet)
-            dependency_results = dependency_executor.execute(
-                requests=initial.dependency_evidence_requests,
-                attempt=failed_attempt,
-                initial_packet=packet,
+
+        request_results[attempt_id] = execute_and_publish(
+            manifest, "T05", lambda: request_extractor.extract(attempt, events)
+        )
+        http_result, nas_ngap_result, pfcp_result = execute_explicit_detectors(
+            manifest=manifest,
+            attempt=attempt,
+            events=events,
+            context=context,
+        )
+        explicit_results[attempt_id] = (
+            http_result,
+            nas_ngap_result,
+            pfcp_result,
+        )
+        missing_results[attempt_id] = execute_and_publish(
+            manifest,
+            "T09",
+            lambda: missing_detector.detect(
+                attempt=attempt,
+                events=events,
+                explicit_results=explicit_results[attempt_id],
+                context=context,
+            ),
+        )
+        timelines[attempt_id] = execute_and_publish(
+            manifest,
+            "T10",
+            lambda: timeline_builder.build_primary(
+                attempt,
+                request_results[attempt_id],
+                explicit_results[attempt_id],
+                missing_results[attempt_id],
+            ),
+        )
+
+    diagnostic_attempts = [a for a in attempts if a.outcome != "succeeded"]
+    for attempt in diagnostic_attempts:
+        attempt_id = attempt.attempt_id
+        comparisons[attempt_id] = execute_and_publish(
+            manifest,
+            "T11",
+            lambda: comparator.compare(
+                target=attempt,
+                attempts=attempts,
+                requests=request_results,
+                timelines=timelines,
+            ),
+        )
+        attempt_candidates = collect_candidates(
+            explicit_results[attempt_id], missing_results[attempt_id]
+        )
+        primary_roots[attempt_id] = execute_and_publish(
+            manifest,
+            "T12:primary",
+            lambda: ranker.rank_primary(
+                attempt=attempt,
+                candidates=attempt_candidates,
+                comparison=comparisons[attempt_id],
+            ),
+        )
+
+    scenario_primary = None
+    if scenario_parse and scenario_parse.scenario:
+        scenario_primary = execute_and_publish(
+            manifest,
+            "T14:primary",
+            lambda: scenario_validator.validate_primary(
+                scenario_parse.scenario,
+                attempts,
+                request_results,
+                missing_results,
+                primary_reader,
+            ),
+        )
+
+    diagnoses = {}
+    initial_packets = {}
+    initial_diagnoses = {}
+    dependency_outcomes_by_attempt = {}
+    dependency_results_by_attempt = {}
+    expanded_roots = {}
+    scenario_expanded = scenario_primary
+
+    if provider.enabled:
+        model_attempts = model_attempt_selector.select(
+            diagnostic_attempts, request, scenario_primary
+        )
+
+        # Finish every initial pass and approved inspection before producing any
+        # run-level dependency-expanded scenario revision or final model pass.
+        for attempt in model_attempts:
+            attempt_id = attempt.attempt_id
+            initial_packets[attempt_id] = execute_and_publish(
+                manifest,
+                "T15:initial",
+                lambda: evidence_builder.build_initial(
+                    attempt=attempt,
+                    request_result=request_results[attempt_id],
+                    timeline=timelines[attempt_id],
+                    comparison=comparisons[attempt_id],
+                    root=primary_roots[attempt_id],
+                    scenario=scenario_primary,
+                ),
+            )
+            initial_diagnoses[attempt_id] = execute_and_publish(
+                manifest,
+                "T16:initial",
+                lambda: diagnosis_generator.generate_initial(
+                    initial_packets[attempt_id]
+                ),
+            )
+            dependency_outcomes_by_attempt[attempt_id] = (
+                dependency_executor.settle_approved(
+                    requests=initial_diagnoses[attempt_id].dependency_evidence_requests,
+                    attempt=attempt,
+                    initial_packet=initial_packets[attempt_id],
+                    manifest=manifest,
+                )
+            )
+            dependency_results_by_attempt[attempt_id] = (
+                expansion_validator.admit(
+                    outcomes=dependency_outcomes_by_attempt[attempt_id],
+                    analysis_id=run.analysis_id,
+                    attempt_id=attempt_id,
+                    initial_packet=initial_packets[attempt_id],
+                    primary_ranking=primary_roots[attempt_id],
+                    primary_scenario=scenario_primary,
+                )
             )
 
-            if dependency_results:
-                final_packet = expanded_evidence_builder.build(
-                    packet, dependency_results
-                )
-                diagnoses[failed_attempt.attempt_id] = provider.generate_final_diagnosis(
-                    final_packet
-                )
-            else:
-                diagnoses[failed_attempt.attempt_id] = initial
+        for attempt in model_attempts:
+            attempt_id = attempt.attempt_id
+            dependency_results = dependency_results_by_attempt[attempt_id]
+            if not dependency_results:
+                diagnoses[attempt_id] = initial_diagnoses[attempt_id]
+                continue
 
-    report = report_builder.build(...)
-    run_store.write_report(report)
+            expanded_roots[attempt_id] = execute_and_publish(
+                manifest,
+                "T12:dependency_expanded",
+                lambda: ranker.rank_dependency_expanded(
+                    attempt=attempt,
+                    primary_result=primary_roots[attempt_id],
+                    dependency_results=dependency_results,
+                    comparison=comparisons[attempt_id],
+                ),
+            )
+
+        completed_dependencies = {
+            attempt_id: results
+            for attempt_id, results in dependency_results_by_attempt.items()
+            if results
+        }
+        if scenario_primary and completed_dependencies:
+            scenario_expanded = execute_and_publish(
+                manifest,
+                "T14:dependency_expanded",
+                lambda: scenario_validator.validate_expanded(
+                    scenario_primary, completed_dependencies
+                ),
+            )
+
+        for attempt in model_attempts:
+            attempt_id = attempt.attempt_id
+            dependency_results = dependency_results_by_attempt[attempt_id]
+            if not dependency_results:
+                continue
+
+            final_packet = execute_and_publish(
+                manifest,
+                "T15:dependency_expanded",
+                lambda: evidence_builder.build_expanded(
+                    initial_packets[attempt_id],
+                    dependency_results,
+                    expanded_roots[attempt_id],
+                    scenario_expanded,
+                ),
+            )
+            diagnoses[attempt_id] = execute_and_publish(
+                manifest,
+                "T16:final",
+                lambda: diagnosis_generator.generate_final(final_packet),
+            )
+
+    analysis_state = manifest.build_analysis_state(
+        attempts=attempts,
+        requests=request_results,
+        explicit=explicit_results,
+        missing=missing_results,
+        timelines=timelines,
+        comparisons=comparisons,
+        primary_roots=primary_roots,
+        expanded_roots=expanded_roots,
+        scenario=scenario_expanded,
+        dependencies=dependency_results_by_attempt,
+        dependency_outcomes=dependency_outcomes_by_attempt,
+        diagnoses=diagnoses,
+    )
+    report = execute_and_publish(
+        manifest, "T17", lambda: report_builder.render(analysis_state)
+    )
+    run_manifest.finalize(manifest, report.status)
     return report
 ```
+
+`execute_explicit_detectors` invokes T06, T07 and T08 with the same attempt-scoped `DetectionContext`, persists each result independently, and returns only after all three complete or reach their documented partial/failure outcome. `DependencyToolExecutor.settle_approved` performs request validation before creating scoped readers, waits for every approved request to terminate and returns all outcomes for reporting. `expansion_validator.admit` returns only lineage- and integrity-valid `completed`, `empty` or `partial` results in canonical order. T22 and T23 are internal calls and are still recorded as nested manifest invocations. T18-T20 calls are issued by their authorized consumers and persisted through the same manifest helper even though they do not appear as unconditional calls above.
 
 ## 20. Logging and Metrics
 
@@ -1327,8 +1593,25 @@ Required fixture cases:
 42. A UDM-facing subscriber-data error triggers bounded UDR inspection and reveals the causal UDR failure.
 43. The model requests capture-wide NRF/UDR data and the validator rejects or clamps the request.
 44. A final-pass dependency request is rejected and does not create a third model pass.
+45. Two failed attempts in one run retain disjoint candidate sets, rankings, packets and diagnoses.
+46. T06/T07/T08 may complete in any order, but T09 for an attempt never starts until all three results are published.
+47. No scenario skips T13/T14 without degrading deterministic status; an invalid/partial scenario result does not stop capture analysis.
+48. `provider=none` skips T15/T16/T24/T25 and still publishes a deterministic T17 report for every attempt.
+49. An enabled provider with no dependency request performs one initial pass and no final pass.
+50. Dependency requests from multiple selected attempts complete before one run-level dependency-expanded T14 revision and before any final T16 pass.
+51. T18/T19/T20 remain uninvoked when retained evidence is sufficient and cannot be reached without a bounded capability-checked request.
+52. Direct top-level invocation of T22 or T23 is rejected; both succeed only under their documented T24/T25 parent invocation.
+53. Empty admitted inspection result produces one expanded T12/T15 generation with unchanged primary cause plus an inspected-no-match limitation.
+54. Partial admitted inspection contributes only integrity-valid evidence and preserves missing portions as limitations.
+55. Failed or integrity-invalid inspection is visible in T17 but cannot appear in T12, T14, T15 or final T16 evidence.
+56. NRF and UDR inspections completing in opposite orders produce byte-identical admitted-result ordering, expanded revisions and packet IDs.
+57. Expanded T15 construction fails for stale primary ranking, stale scenario validation, cross-attempt result, duplicate revision or mismatched parent packet.
 
-### 21.3 Golden reports
+### 21.3 Orchestration contract tests
+
+Use fake tool adapters that append `(tool, attempt_id, pass_stage)` to an invocation log and return deterministic fixture results. Assert the dependency order and gates defined in section 19. The test must randomize completion order of T06-T08 and run at least two attempts concurrently to expose global-list or late-binding mistakes. Manifest assertions must prove that each executed result is published before its completed status and that skipped optional stages are represented without fabricated artifacts.
+
+### 21.4 Golden reports
 
 Store expected deterministic `report.json` files for fixture captures. Model prose is not golden-tested. Tests validate model schema and evidence references only.
 

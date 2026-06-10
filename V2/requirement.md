@@ -273,6 +273,35 @@ Tools are deterministic Python services with JSON-compatible inputs and outputs.
 
 Implementation-ready specifications for T01-T25 are indexed in `tools/README.md`. Each tool file is normative for its detailed contracts, algorithms, failure behavior, tests, and acceptance criteria.
 
+### 7.1 Canonical execution graph
+
+The harness must implement the following dependency graph. Numbering defines dependencies, not a requirement to serialize independent work:
+
+1. Validate the request/configuration, create the run, retain the source PCAP and initialize the run manifest.
+2. When scenario text is supplied, run T13 and persist its result. T13 is independent of protocol decoding, but T14 cannot run until both T13 and its deterministic evidence inputs are complete.
+3. Run T01, then T02, T03 and T04 in order. T21 classifies capture phases after T04 establishes attempt boundaries.
+4. For every persisted attempt, run T05. Run T06, T07 and T08 against only that attempt's assigned primary events; these explicit detectors may run concurrently.
+5. Run T09 only after the T06-T08 results for the same attempt are available. T09 consumes those explicit candidates for suppression/linking and must not duplicate them.
+6. Build the primary T10 timeline for every attempt. Failed/incomplete attempts may then run T11 against eligible earlier successful attempts and T12 against only their own candidates/comparison. Successful attempts remain available as baselines and report data.
+7. When a scenario was supplied, run primary T14 validation after T05 and T09 artifacts exist. Scenario absence produces no scenario-validation stage, not a failure.
+8. T17 deterministic reporting is mandatory even when no model provider is configured. T15 and T16 run only for failed/incomplete attempts selected by the configured model-narration policy and only when a provider is enabled.
+9. An initial T16 pass may request T24 and/or T25. The orchestrator validates every request before granting a scoped dependency capability. T22 runs only inside T24; T23 runs only inside T24/T25. No hidden NRF/UDR reader is exposed to primary tools.
+10. When dependency inspection returns at least one valid admitted outcome, rerun dependency-aware T12 and, where applicable, T14 before building the dependency-expanded T15 packet and invoking one final T16 pass. Final-pass tool requests are rejected.
+11. T18, T19 and T20 are on-demand evidence services, not unconditional primary stages. T18 performs capability-scoped lookup, T19 obtains bounded context, and T20 runs only after a validated need for missing decode detail. Their results are immutable derived artifacts and do not silently alter earlier assignments or findings.
+12. Run T17 after deterministic processing and any enabled model/dependency work. Persist the final report and manifest status even when optional scenario, provider or dependency stages are absent, disabled, partial or failed.
+
+All per-attempt artifacts and candidate collections must remain keyed by `attempt_id`. A candidate from one attempt must never enter another attempt's ranking merely because both were processed in the same run. Every executed stage must publish its result/revision before the manifest records that stage as complete.
+
+Dependency expansion obeys these additional rules:
+
+- All approved NRF/UDR requests for the selected attempt must reach a terminal inspection status before expanded deterministic processing begins.
+- Published inspection results with status `completed`, `empty`, or `partial` and valid integrity/revision metadata are valid expansion inputs. `failed`, unpublished, mismatched or integrity-invalid results remain reportable stage outcomes but cannot enter T12, T14 or T15 evidence.
+- T12 must create a new immutable dependency-expanded ranking from the primary ranking, the exact valid inspection-result revisions and their T23 impact/candidates. It must not overwrite the primary ranking.
+- T14 creates a new immutable validation only when selected scenario checkpoints depend on inspected NRF/UDR evidence. Unaffected primary checkpoint results remain unchanged and retain their evidence references.
+- T15 may build an expanded packet only from the exact initial packet, the dependency-expanded T12 result for that attempt, the applicable latest T14 revision, and the same valid inspection-result revisions. It must reject stale, cross-attempt or incomplete lineage.
+- T16 final pass consumes only that validated expanded packet. If no valid inspection result exists, no expanded packet or final pass is created; the initial diagnosis and deterministic report remain usable.
+- The report must preserve primary and dependency-expanded revisions, inspection failures/empty results and any change in primary candidate or scenario checkpoint status.
+
 ### T01: `decode_capture`
 
 Purpose: Run the Go decoders and validate their output.

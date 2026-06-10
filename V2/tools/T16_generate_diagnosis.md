@@ -41,6 +41,8 @@ class GenerateDiagnosisRequest(BaseModel):
 class GenerateDiagnosisResult(BaseModel):
     schema_version: Literal["2.0"]
     attempt_id: UUID
+    packet_id: UUID
+    pass_stage: Literal["initial", "final"]
     status: Literal["success", "failed", "disabled"]
     diagnosis: ModelDiagnosis | None
     provider: ProviderMetadata | None
@@ -142,7 +144,15 @@ At most one NRF and one UDR request may be returned. Extra requests are rejected
 
 ## 10. Final Pass
 
-Final prompt includes expanded dependency results and requires:
+Before provider invocation, final-pass validation requires:
+
+- request `pass_stage=final` and packet `pass_stage=dependency_expanded`;
+- packet `parent_packet_id` resolves to the successful initial packet for the same analysis/attempt;
+- packet root-cause revision is dependency-expanded and its parent/consumed revisions match packet lineage;
+- applicable scenario and dependency revisions match the packet manifest;
+- no final call has already been recorded for this initial packet generation.
+
+Final prompt includes the revised deterministic ranking/checkpoints plus expanded dependency results and requires:
 
 - Reassess explanation using new bounded evidence.
 - State whether dependency was causal/contributing/unrelated/inconclusive consistently with T23/T12.
@@ -179,6 +189,7 @@ Validate:
 - No new frame numbers/messages/observed values appear as factual citations.
 - Primary candidate conflict is explicitly recorded rather than silently replaced.
 - Request tool allowed for pass stage.
+- Request/pass-stage and packet-lineage rules hold.
 - Initial request cites visible evidence and target selector fields.
 - Text lengths/list counts are bounded.
 
@@ -259,6 +270,7 @@ Persist validated diagnosis and metadata. Raw provider response persistence is c
 - Provider error/malformed after retry: failed result, deterministic pipeline continues.
 - Invalid candidate/evidence references after repair: failed diagnosis.
 - Final pass includes tool request: strip/reject request, preserve otherwise valid diagnosis with warning.
+- Final packet lineage mismatch, stale deterministic revision or duplicate final invocation: reject before provider call.
 - Model conflicts with deterministic observation: retain conflict, deterministic value remains authoritative.
 - Persistence failure: model result may be discarded; report records provider-stage failure.
 
@@ -349,6 +361,7 @@ V2/harness/schemas/
 - OpenRouter unmasked packet rejected.
 - API key never appears in logs/errors/artifacts.
 - Final pass attempts recursive tool call.
+- Final pass with initial packet, stale T12/T14 revision, mismatched dependency revision or reused parent packet is rejected before provider invocation.
 
 ## 27. Acceptance Criteria
 
@@ -362,3 +375,4 @@ T16 is complete when:
 6. Provider failure leaves deterministic analysis/reporting usable.
 7. Keys and sensitive evidence never leak to logs/artifacts/remote calls outside policy.
 8. Metadata and token/latency usage are auditable.
+9. Every result records packet/pass lineage and final calls consume only dependency-expanded deterministic packets.

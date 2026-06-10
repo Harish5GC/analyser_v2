@@ -57,6 +57,8 @@ class InspectUDRFlowRequest(BaseModel):
 class UDRInspectionResult(BaseModel):
     schema_version: Literal["2.0"]
     request_id: UUID
+    analysis_id: UUID
+    initial_packet_id: UUID
     attempt_id: UUID
     status: Literal["completed", "empty", "partial", "failed"]
     effective_window: FrameWindow
@@ -71,6 +73,8 @@ class UDRInspectionResult(BaseModel):
     revision: str
 ```
 
+`analysis_id`, `initial_packet_id`, `attempt_id` and `request_id` are copied from the validated request and are immutable lineage fields. A result missing or mismatching any field cannot enter dependency-expanded T12/T14/T15 processing.
+
 ## 5. Pre-Execution Request Validation
 
 ### Attempt/pass/evidence
@@ -79,6 +83,8 @@ class UDRInspectionResult(BaseModel):
 - Request originated in initial pass.
 - Cited initial evidence exists and shows subscriber-data/dependency symptom.
 - Final-pass/replayed request rejected.
+
+The published result copies request lineage fields exactly and includes them in its revision. `completed`, `empty` and `partial` are terminal evidence outcomes eligible for later admission after integrity validation. `failed` is terminal for orchestration/reporting but is never an expanded deterministic evidence input.
 
 ### Selectors
 
@@ -372,6 +378,7 @@ V2/harness/storage/
 
 - Valid consumer/operation/masked-key combinations.
 - Missing/wrong initial evidence, attempt, packet, reason.
+- Result copies analysis/attempt/initial-packet/request lineage exactly and includes it in revision hashing.
 - Clear SUPI/GPSI selector rejected.
 - Wildcard/subscriber-wide/capture-wide/final/replayed request.
 - Window clamp and request limit.
@@ -386,6 +393,7 @@ V2/harness/storage/
 - Prior successful equivalent baseline.
 - Pre-call outage recovered before attempt.
 - One justified expansion.
+- Empty and partial outcomes remain publishable terminal results; failed/publication outcomes are not admitted to expanded processing.
 
 ### 27.3 Privacy/integration tests
 
@@ -408,3 +416,4 @@ T25 is complete when:
 6. Only T23 causal/contributing results become T12-eligible.
 7. One justified bounded expansion and one baseline are maximums.
 8. Requests/results/access/masking are immutable and auditable.
+9. Result lineage identifies the exact analysis, attempt, initial packet and approved request.

@@ -41,13 +41,14 @@ class RankRootCausesRequest(BaseModel):
     comparison: AttemptComparison | None
     dependency_results: list[DependencyInspectionResult] = Field(default_factory=list)
     pass_stage: Literal["primary", "dependency_expanded"]
+    primary_ranking_revision: str | None = None
     ranking_policy_version: str
 
 
 class RootCauseResult(BaseModel):
     schema_version: Literal["2.0"]
     attempt_id: UUID
-    pass_stage: str
+    pass_stage: Literal["primary", "dependency_expanded"]
     primary_candidate_id: UUID | None
     alternative_candidate_ids: list[UUID]
     downstream_candidate_ids: list[UUID]
@@ -56,8 +57,18 @@ class RootCauseResult(BaseModel):
     confidence: Literal["high", "medium", "low", "inconclusive"]
     rationale_codes: list[str]
     limitations: list[str]
+    parent_ranking_revision: str | None
+    dependency_result_revisions: list[str]
     ranking_revision: str
 ```
+
+Request validation rules:
+
+- `pass_stage=primary` requires no dependency results and `primary_ranking_revision=None`.
+- `pass_stage=dependency_expanded` requires `primary_ranking_revision` to resolve to the immutable primary result for the same analysis/attempt.
+- Every dependency result must match the analysis, attempt and initial packet approved for this expansion, have status `completed`, `empty` or `partial`, and pass revision/evidence integrity checks.
+- Sort dependency results by tool type and request ID before candidate collection and revision hashing. Duplicate request IDs or revisions are rejected.
+- The dependency-expanded result sets `parent_ranking_revision` to the supplied primary revision and records the sorted consumed revisions. Primary results set an empty dependency-revision list.
 
 ## 5. Candidate Eligibility
 
@@ -192,10 +203,13 @@ On primary pass, hidden NRF/UDR events cannot appear. The result may remain inco
 
 After T24/T25:
 
+- Wait until every approved dependency request for the attempt has reached terminal status; do not rerank once per arriving result.
 - Add only inspection-returned candidates/evidence.
 - Require T23 impact `causal` or `contributing` for primary eligibility.
 - `unrelated` is excluded.
 - `inconclusive` may be alternative only with low confidence, not primary unless no stronger candidate and policy permits explicit inconclusive reporting.
+- `empty` inspection results add no candidates but remain revision inputs and may add an inspected-no-match limitation.
+- `partial` results contribute only evidence/candidates that passed integrity validation; missing portions remain limitations.
 - Preserve primary-pass result in report history for audit.
 
 No third recursive pass exists.
@@ -270,6 +284,7 @@ Ranking revision hash includes:
 - Attempt/profile revision.
 - Comparison revision.
 - Dependency result revisions.
+- Parent primary ranking revision for dependency-expanded runs.
 - Ranking policy version/config hash.
 
 Persist:
@@ -360,6 +375,9 @@ V2/harness/models/
 - Recovered startup anomaly excluded.
 - T24 NRF result changes primary ranking.
 - T25 UDR result contributes but does not replace stronger visible cause.
+- NRF and UDR results arriving in opposite orders produce one identical expanded revision.
+- Empty inspection produces an expanded revision with unchanged primary candidate and an inspected-no-match limitation.
+- One valid and one failed inspection reranks using only the valid result and reports the failed request separately.
 - Capture truncation yields inconclusive.
 - Changed UE request explains baseline divergence.
 
@@ -370,6 +388,7 @@ V2/harness/models/
 - Unrelated/inconclusive hidden dependency cannot be promoted improperly.
 - Model narrative cannot alter ranking.
 - T12 cannot access event partitions.
+- Stale primary revision, cross-attempt result, duplicate result or failed inspection result is rejected.
 
 ## 26. Acceptance Criteria
 
@@ -384,3 +403,4 @@ T12 is complete when:
 7. Ambiguity yields alternatives or inconclusive output rather than a forced answer.
 8. Primary and dependency-expanded rankings are immutable/auditable.
 9. No model or direct evidence-reader access exists.
+10. Expanded ranking records its primary parent and exact consumed dependency revisions.

@@ -24,7 +24,7 @@ T14 must not:
 - T05 request results.
 - T09 stage/visibility results.
 - Primary canonical events and evidence references.
-- Optional completed T24/T25 inspection result only when a checkpoint explicitly concerns NRF/UDR and the dependency flow was requested/inspected.
+- Optional admitted T24/T25 inspection result only when a checkpoint explicitly concerns NRF/UDR and the dependency flow was requested/inspected. Admitted statuses are `completed`, `empty` and `partial`; failed/invalid outcomes remain reporting metadata only.
 
 Initial validation uses primary evidence only. Dependency checkpoints may remain inconclusive until inspected.
 
@@ -37,6 +37,8 @@ class ValidateScenarioRequest(BaseModel):
     scenario: ScenarioSpec
     explicit_attempt_id: UUID | None
     dependency_results: list[DependencyInspectionResult] = Field(default_factory=list)
+    pass_stage: Literal["primary", "dependency_expanded"]
+    primary_validation_revision: str | None = None
     validator_policy_version: str
 
 
@@ -49,8 +51,13 @@ class ValidateScenarioResult(BaseModel):
     overall_status: Literal["verified", "failed", "inconclusive", "not_applicable"]
     conflicts: list[ScenarioEvidenceConflict]
     warnings: list[str]
+    pass_stage: Literal["primary", "dependency_expanded"]
+    parent_validation_revision: str | None
+    dependency_result_revisions: list[str]
     validation_revision: str
 ```
+
+Primary validation requires no dependency results and no parent revision. Dependency-expanded validation requires the immutable primary validation revision plus admitted `completed`, `empty` or `partial` results whose analysis/attempt/initial-packet lineage and integrity were validated by the orchestrator. T14 accepts only results relevant to at least one dependency-aware checkpoint and records exactly the revisions it consumed; unrelated admitted results remain T12/T17 inputs but are not T14 inputs. Consumed results are sorted deterministically and duplicate/stale revisions are rejected.
 
 ## 5. Attempt Selection
 
@@ -188,6 +195,10 @@ For NRF/UDR scenario expectations:
 - Initial validation can identify that dependency evidence is unavailable and mark inconclusive.
 - Scenario text may support a T16 suspicion/request but cannot bypass T24/T25 request validation.
 - After approved inspection, T14 may produce a dependency-expanded checkpoint revision using only returned results.
+- Run one dependency-expanded validation after all selected attempts' approved inspections settle, not once per arriving result.
+- Re-evaluate only checkpoints whose matcher/applicability can consume an admitted dependency result. Copy unaffected checkpoint results unchanged, including evidence IDs and reason codes.
+- An `empty` result proves that the approved bounded inspection found no matching record; checkpoint status still follows visibility and expectation semantics rather than automatically becoming failed or verified.
+- A `partial` result may resolve only the portion supported by valid returned evidence. Failed/invalid results do not enter validation and leave affected checkpoints inconclusive with an inspection-failure reason.
 
 Hidden dependency events are never read directly by T14.
 
@@ -220,6 +231,8 @@ Optional checkpoint failure is reported but does not fail overall unless scenari
 ## 18. Revision and Persistence
 
 Validation revision hash includes scenario spec, selected attempt revisions, request/stage artifacts, dependency result revisions, and validator policy version.
+
+Dependency-expanded revisions additionally include the primary validation parent revision and the sorted revisions actually consumed by dependency-aware checkpoints. The result persists both fields so T15/T17 can verify lineage against a subset of the admitted inspection set.
 
 ```text
 normalized/scenario/
@@ -310,6 +323,8 @@ V2/harness/models/
 - Roaming local breakout versus home routed.
 - Missing interface/capture truncation.
 - Explicit NRF/UDR scenario before and after approved inspection.
+- Multiple attempts with NRF/UDR results arriving in different orders produce one deterministic expanded validation.
+- Empty, partial and failed inspections preserve correct checkpoint semantics.
 - Multiple matching attempts.
 
 ### 25.3 Negative tests
@@ -318,6 +333,7 @@ V2/harness/models/
 - Later accepted DNN does not verify unknown requested DNN.
 - Forbidden event absence is not verified with partial visibility.
 - T14 cannot open NRF/UDR readers.
+- Cross-attempt, stale-parent, duplicate or integrity-invalid dependency result is rejected.
 
 ## 26. Acceptance Criteria
 
@@ -331,3 +347,4 @@ T14 is complete when:
 6. Overall status aggregation is deterministic and configurable.
 7. Dependency checkpoints require completed T24/T25 results.
 8. Model narrative cannot override checkpoint status.
+9. Expanded validation preserves unaffected primary checkpoints and records its parent plus exact dependency revisions.

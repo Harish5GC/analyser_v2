@@ -98,25 +98,40 @@ Responsibilities:
 
 ### 3.2 Analysis orchestrator
 
-The orchestrator owns the run lifecycle and calls components in this order:
+The orchestrator owns run lifecycle and composes tools as a dependency graph. It never supplies a generic event-store handle to primary analysis code and never accumulates candidates from multiple attempts into one ranking input.
 
-1. Validate input and configuration.
-2. Decode PCAP.
-3. Normalize and partition primary, NRF and UDR events.
-4. Build identity graph.
-5. Segment procedure attempts and classify capture phases.
-6. Run primary NGAP/NAS, non-NRF/UDR HTTP/2 and PFCP detectors.
-7. Detect missing state transitions.
-8. Compare failed attempts with prior successes.
-9. Rank primary root-cause candidates.
-10. Parse and validate scenario when supplied.
-11. Build the first evidence packet without detailed NRF/UDR events.
-12. Invoke the first model pass when enabled.
-13. Validate and execute requested NRF/UDR inspection tools, if any.
-14. Merge returned dependency evidence and invoke one final model pass.
-15. Render reports and manifest.
+| Phase | Tools | Placement and gate |
+|---|---|---|
+| Run setup | application/run store | Validate input/configuration, create `analysis_id`, retain source PCAP and initialize the manifest. |
+| Optional scenario parse | T13 | Runs only when scenario text exists. It may execute independently of capture processing, but its persisted result is required before T14. |
+| Capture foundation | T01 -> T02 -> T03 -> T04 -> T21 | Decode, normalize/partition, correlate identities, segment attempts, then classify capture/attempt phases. Each arrow is a hard data dependency. |
+| Per-attempt extraction | T05 | Runs for every attempt and records what the UE/network requested. |
+| Explicit detection | T06, T07, T08 | Run per attempt against assigned primary events. They may execute concurrently but cannot read NRF/UDR partitions. |
+| Implicit detection | T09 | Runs after T06-T08 for the same attempt so explicit failures can suppress or explain missing-transition candidates. |
+| Timeline and baseline | T10, then T11 | T10 builds primary timelines for every attempt. T11 runs for failed/incomplete attempts when eligible earlier successes exist. |
+| Primary determination | T12 | Ranks only candidates belonging to the current failed/incomplete attempt. |
+| Optional scenario validation | T14 | Runs only when T13 produced a scenario; primary validation uses T04/T05/T09 and primary evidence. |
+| Optional model pass | T15 -> T16 | Runs only for configured failed/incomplete attempts when a provider is enabled. Initial T15 packets are primary-only. |
+| Optional dependency inspection | T24/T25, with T22/T23 internal | Runs only for schema-valid initial T16 requests. T22 is internal to T24; T23 is internal to T24/T25. The executor grants scoped NRF/UDR readers only after validation. |
+| Dependency-expanded determination | T12 and applicable T14, then T15 -> T16 | Returned dependency results are deterministic inputs. Ranking and applicable scenario checkpoints are revised before the expanded packet and single final model pass. |
+| On-demand forensic support | T18 -> T19 -> T20 as needed | Capability-scoped lookup/context/re-decode services run only for a validated evidence need. T20 is never directly model-callable. |
+| Reporting | T17 | Always renders deterministic results; optional model/dependency outcomes and their failures are included when present. |
 
-Each stage writes status into `manifest.json`, allowing failed or partial runs to be inspected.
+Every executed stage publishes an immutable result and status before `manifest.json` records completion. Skipped optional stages are recorded as absent/disabled according to their contracts, not treated as failed. A partial optional stage cannot erase already completed deterministic results.
+
+#### Dependency-expanded commit barrier
+
+Dependency expansion is a deterministic commit barrier, not a direct append to the model packet:
+
+1. Settle every approved T24/T25 request for an attempt.
+2. Validate attempt, initial-packet, request and revision lineage for each returned result.
+3. Admit only published `completed`, `empty` or `partial` results with valid integrity metadata; retain failed/invalid results only as stage outcomes.
+4. Publish a new T12 dependency-expanded ranking using the admitted result set.
+5. Publish a new T14 validation only when dependency-aware scenario checkpoints exist.
+6. Build T15 from the exact initial packet plus those revised deterministic artifacts and admitted inspection revisions.
+7. Invoke one T16 final pass. The final result cannot request more tools.
+
+The primary T12/T14 artifacts remain immutable. T17 reports both generations and their differences. If the barrier has no admitted result, the orchestrator does not create an expanded packet or final model call.
 
 ### 3.3 Go decoder process
 

@@ -25,6 +25,16 @@ T17 must not:
 
 T17 reads validated result objects and evidence metadata, not raw partitions.
 
+For each attempt with dependency inspection, T17 receives and preserves:
+
+- primary T12 result and optional dependency-expanded child result;
+- primary T14 validation and optional dependency-expanded child validation;
+- every requested T24/T25 outcome, including `empty`, `partial`, `failed` and excluded integrity-invalid results;
+- initial T16 result and optional final T16 result with packet lineage;
+- a deterministic change summary for primary candidate, alternatives, confidence and scenario checkpoint statuses.
+
+T17 must not present an initial model diagnosis as final after a valid expanded result exists, and must not hide a failed inspection merely because another inspection produced usable evidence.
+
 ## 4. Python Tool Contract
 
 ```python
@@ -299,6 +309,10 @@ V2/harness/schemas/
 - Scenario success/failure.
 - Local/OpenRouter failure fallback.
 - NRF/UDR inspection causal/unrelated/not performed.
+- Empty/partial/failed dependency inspections with admitted-versus-excluded status.
+- Primary ranking preserved beside a dependency-expanded ranking that changes the primary candidate.
+- Primary scenario validation preserved beside an expanded validation that changes only dependency-aware checkpoints.
+- Initial and final model results linked to their exact packet generations.
 - Model conflict with deterministic ranking.
 
 ### 25.3 Negative tests
@@ -307,6 +321,7 @@ V2/harness/schemas/
 - Invalid evidence/model IDs rejected/omitted.
 - Untrusted HTML/Markdown injection escaped.
 - No absolute filesystem paths.
+- Expanded result with missing/stale parent or dependency revision is rejected rather than rendered as authoritative.
 
 ## 26. Acceptance Criteria
 
@@ -318,5 +333,7 @@ T17 is complete when:
 4. Deterministic results cannot be silently overwritten by model narrative.
 5. Partial capture/provider/evidence conditions are visible.
 6. Dependency inspection status is explicit and does not imply uninspected health.
+7. Primary and dependency-expanded T12/T14 generations and their deterministic differences remain auditable.
+8. Initial/final model results are labeled by packet/pass lineage, and a failed inspection is never hidden by another successful inspection.
 7. Sensitive data and absolute paths are excluded.
 8. Publication is atomic and auditable.
