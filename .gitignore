@@ -1,0 +1,5 @@
+# This repository currently owns only the V2 specification tree.
+/*
+!/.gitignore
+!/V2/
+!/V2/**
