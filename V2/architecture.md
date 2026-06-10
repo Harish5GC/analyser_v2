@@ -197,7 +197,12 @@ The evidence repository retains:
 
 Every normalized event and failure candidate points to one or more full records. The repository supports lookups by frame, time, protocol stream and correlation identifier without reparsing all files.
 
-If the requested field was not included in the original `tshark` tree, the repository invokes the bounded re-decode service against the retained PCAP and registers the output as new derived evidence.
+If the requested field was not included in the original `tshark` tree, the
+repository invokes T20. T20 plans protocol context, extracts a bounded slice
+through the optional T01 packet-access index or an honestly accounted
+scan-and-preslice path, dissects only that slice, maps slice frames back to
+source frames, and registers the output as new derived evidence. Result size,
+slice/dissection work and source scan cost are independent bounds.
 
 ### 3.7 Identity graph
 

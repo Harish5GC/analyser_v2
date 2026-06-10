@@ -60,6 +60,8 @@ The current implementation is not yet compliant with this specification because 
 - Reconstructing complete HTTP/2 stream documents.
 - Writing full NGAP/NAS and PFCP message records.
 - Writing protocol indexes and the decoder manifest.
+- Optionally writing a packet-access index for T20 indexed extraction when
+  enabled by run policy.
 - Atomic artifact publication and checksums.
 
 ## 4. Python Tool Contract
@@ -75,6 +77,7 @@ class DecodeCaptureRequest(BaseModel):
         default_factory=lambda: {"http2", "ngap", "pfcp"}
     )
     retain_raw_packets: bool = True
+    build_packet_access_index: bool = False
 
 
 class DecodeCaptureResult(BaseModel):
@@ -104,7 +107,8 @@ Target command:
   --output-dir <run-dir>/decoded \
   --protocol all \
   --format v2 \
-  --retain-raw=true
+  --retain-raw=true \
+  --packet-access-index=false
 ```
 
 Supported options:
@@ -116,6 +120,7 @@ decode PCAP
   --protocol VALUE            all|http2|ngap|pfcp; repeatable
   --format VALUE              v2 only for this contract
   --retain-raw BOOL           default true
+  --packet-access-index BOOL  default false; build T20 frame/time/offset index
   --parallel BOOL             default true
   --tshark PATH               default resolved from PATH
 ```
@@ -156,6 +161,9 @@ output/<analysis-id>/
       pfcp/
         messages.jsonl
         message_index.jsonl
+    indexes/
+      packet_access_index.bin       optional
+      packet_access_index.json      optional descriptor
 ```
 
 Every completed or incomplete HTTP/2 stream is a separate JSON document. The filename is a UUIDv4 generated when the stream state is first created. Transport identity remains inside the document and index; the UUID filename must not replace `tcp.stream` or `http2.streamid` as evidence.
@@ -410,6 +418,31 @@ For collections containing many HTTP stream documents, the manifest may describe
 
 Absolute host paths must not be written to portable manifests or reports.
 
+### 13.1 Optional packet-access index
+
+When `--packet-access-index=true`, T01 performs one streaming pass over the
+retained, materialized capture and publishes a versioned index usable by T20.
+The index is an optimization and evidence-access artifact, not a replacement
+for the source PCAP.
+
+Each packet entry records at least source frame number, timestamp, packet/block
+offset and length, captured/original length, pcapng section/interface identity
+and the metadata-block key required to reconstruct a valid slice. The
+descriptor records source checksum/size/format, index schema/version, entry
+count, first/last frame/time, index checksum/size and construction timing.
+
+For pcapng, extraction must also copy required section header, interface
+description and other interpretation-critical blocks. An index that cannot
+reconstruct these blocks is not advertised as T20-capable. Compressed input is
+first materialized as the immutable retained capture; offsets always address
+that retained file and never the caller's compressed source.
+
+Index construction is atomic and manifest-last like every other T01 artifact.
+Index failure does not invalidate otherwise usable protocol decode when the
+index was optional: mark the index artifact failed/absent and the overall T01
+result partial with a registered warning. When run policy requires indexed
+T20 access, index failure is a critical T01 failure.
+
 ## 14. Failure Semantics
 
 - Unreadable PCAP: fail before starting protocol jobs.
@@ -432,6 +465,9 @@ Absolute host paths must not be written to portable manifests or reports.
 - Run protocol jobs concurrently by default, with a serial mode for constrained storage.
 - Bound stderr capture and warning counts.
 - Avoid opening one file per active stream; open the UUID document only when publishing the completed state.
+- Packet-access indexing is one O(source size) streaming pass with bounded
+  memory. Record its independent elapsed time, bytes read, entries written,
+  output bytes and throughput so its cost is not hidden inside protocol decode.
 
 The user-observed current baseline is approximately 3,500 packets/second. On the same host and reference capture, the initial V2 implementation should target the same throughput and must record packets/second, elapsed time, peak RSS, stream count, and artifact count. A regression greater than 20% requires investigation before acceptance.
 
@@ -456,6 +492,7 @@ decode_command.go              v2 decode CLI parsing and orchestration
 decode_config.go               validated command configuration
 decoder_manifest.go            manifest models and publication
 artifact_writer.go             staging, atomic rename, checksum, counts
+packet_access_index.go          optional pcap/pcapng frame/time/block-offset index
 tshark_runner.go               context-aware tshark process wrapper
 http2_decoder.go               packet parsing and stream-state reconstruction
 http2_stream_writer.go         UUID document and stream-index publication
@@ -547,6 +584,8 @@ Only `runner.py` is exposed to `orchestrator.py`. Downstream normalization recei
 - PFCP heartbeat retention.
 - Atomic writer cleanup after failure.
 - Manifest checksum and record-count generation.
+- Classic pcap and multi-interface pcapng packet-access index entries.
+- Index descriptor/source checksum and pcapng metadata-block reconstruction.
 
 ### 20.2 Integration tests
 
@@ -559,6 +598,8 @@ Only `runner.py` is exposed to `orchestrator.py`. Downstream normalization recei
 - Paths containing spaces.
 - Corrupt or unreadable PCAP.
 - Manifest tampering detected by Python validation.
+- T20 indexed extraction of early/middle/late frame and time windows.
+- Optional index failure yields partial T01; required index failure is fatal.
 - Performance comparison against the current approximately 3,500 packets/second baseline.
 
 ## 21. Acceptance Criteria
@@ -576,3 +617,5 @@ T01 is complete when:
 9. Partial protocol failure does not destroy usable outputs.
 10. No NRF/UDR filtering, diagnosis, or model invocation occurs in T01.
 11. Performance is benchmarked against the current decoder on the same capture and host.
+12. When enabled, the packet-access index is immutable, source-checksummed,
+    pcap/pcapng reconstruction-capable and independently benchmarked.

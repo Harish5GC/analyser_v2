@@ -649,7 +649,9 @@ Required behavior:
 
 ### T20: `targeted_redecode`
 
-Purpose: Re-run `tshark` over a narrowly selected part of the retained PCAP when the original decoder did not request a required protocol tree or field.
+Purpose: Extract a protocol-correct bounded slice from the retained PCAP and
+re-run `tshark` when the original decoder did not request a required protocol
+tree or field.
 
 Inputs:
 
@@ -662,7 +664,18 @@ Required behavior:
 
 - Operate only on the retained source PCAP.
 - Use validated argument construction; callers may not supply arbitrary shell commands.
-- Record `tshark` version, command arguments, output checksum and query provenance.
+- Enforce and report result-size, decoder-resource and source-scan bounds as
+  separate quantities. Pre-slicing may reduce decoder work but must not be
+  represented as source-size-independent access unless a validated T01 packet
+  index was used.
+- Preserve TCP/HTTP2/HPACK state, SCTP/NGAP reassembly, IP fragmentation and
+  pcap/pcapng interpretation context. Fail explicitly when required context is
+  unavailable, unauthorized or over limit.
+- Record source/index/slice checksums, source-frame mapping, extractor and
+  `tshark` versions/arguments, context expansion, measured scan/decode cost,
+  output checksum and query provenance.
+- Remove transient slice/map staging after success or failure without deleting
+  the retained source or published evidence.
 - Write output under `evidence/redecode/`; never alter original decoded artifacts.
 - Register new evidence references so later tools and reports can cite the result.
 

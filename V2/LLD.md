@@ -688,19 +688,38 @@ The model never receives the unbounded result automatically. `EvidenceBuilder` s
 
 ### 7.3 Targeted re-decode safety
 
-`RedecodeQuery` accepts structured fields only:
+T20's full normative contract is `tools/T20_targeted_redecode.md`.
+`RedecodeQuery` accepts structured fields only; display predicates are a typed
+allowlisted AST rather than caller-supplied tshark text:
 
 ```python
 class RedecodeQuery(BaseModel):
-    start_frame: int
-    end_frame: int
-    display_filter: str | None
-    protocol_trees: list[str]
-    fields: list[str]
-    decode_as: list[DecodeAsRule]
+    selection: RedecodeSelection
+    display_filter: SafeDisplayFilter | None
+    protocol_trees: list[AllowedProtocolTree]
+    fields: list[AllowedField]
+    decode_as: list[ValidatedDecodeAs]
+    source_access_requirement: Literal["allow_scan", "require_indexed"]
 ```
 
-The implementation builds `tshark` arguments directly without a shell, limits the frame range, validates protocol/field names and enforces timeout/output-size limits.
+The implementation applies three independent limits: published result
+records/bytes, extracted slice plus tshark resources, and source bytes/packets
+scanned to locate the slice. Default scan-preslice mode is O(source position)
+even though tshark sees only the slice. Source-size-independent extraction is
+claimed only when T01's optional validated frame/time/block-offset index is
+used.
+
+Before extraction, a deterministic context planner expands target packets to
+include TCP reassembly and HTTP/2 HPACK state, complete SCTP/NGAP fragments,
+complete IP datagrams, decode-as state and required pcapng metadata. Missing,
+unauthorized or over-limit context fails closed. The extractor produces a
+checksummed slice-local-to-source frame map; all derived `SourceRef` values are
+restored through that map.
+
+Slices and frame maps live only in query-owned staging. The published manifest
+retains source/index/slice/map checksums, access mode, context ranges, extractor
+and tshark identities, measured scan/dissection/output costs and cleanup
+outcome. Staging is removed on success and every failure path.
 
 ## 8. Correlation Algorithm
 

@@ -16,12 +16,12 @@ it). Backlog items are V2-001..V2-062 in priority groups P0-P4.
   added the LLD/tools index pointers, replaced T14's duplicate stage literals
   with shared `EvidenceStage`, updated `reviews/TODO.md`, and synchronized the
   root `TODO.md`.
-- **P1 (V2-018..034)** — not started, with one exception: `LLD.md` §29
+- **P1 (V2-018..034)** — V2-018 is complete. `LLD.md` §29
   (Configuration and Policy Resolver) was written early because P0's
   `DetectionContext` depends on it. That covers the LLD half of **V2-021**;
-  residual V2-021 work: reference the resolver from T11/T12/T21 (replace
-  their bare `policy_version` strings the way T06-T09 now do) and add a
-  reliability bullet to `requirement.md` §11.
+  residual work: reference the resolver from T11/T12/T21 (replace their bare
+  `policy_version` strings the way T06-T09 now do) and add a reliability
+  bullet to `requirement.md` §11.
 - **P2/P3/P4** — not started. Note: several P3 items are already partially
   satisfied by P0 side effects (see §5).
 
@@ -195,5 +195,5 @@ it). Backlog items are V2-001..V2-062 in priority groups P0-P4.
 
 ## 6. Session task list state
 
-Task #1 (P0) complete. Tasks #2-#5 (P1-P4) remain pending. TODO checkbox
-update and root synchronization are complete.
+Task #1 (P0) complete. P1 is in progress with V2-018 complete; V2-019 is the
+next open item. Tasks P2-P4 remain pending. TODO synchronization is current.
