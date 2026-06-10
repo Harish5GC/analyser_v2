@@ -175,7 +175,7 @@ Readers must:
 11. Compute checksums and publish artifacts atomically.
 12. Publish `normalization_manifest.json` last.
 
-Re-running T02 for the same analysis is idempotent when source checksums, configuration, and normalizer version match. Otherwise, the existing completed output must not be overwritten; the caller creates a new derived normalization revision.
+Re-running T02 for the same analysis is idempotent when source checksums, configuration, and normalizer version match. Otherwise, the existing completed output must not be overwritten; T02 mints a new sibling normalization revision per the `LLD.md` section 25 revision model (each tool mints its own revision; callers never mint on a tool's behalf).
 
 ## 8. HTTP/2 Normalization
 

@@ -413,6 +413,7 @@ Absolute host paths must not be written to portable manifests or reports.
 ## 14. Failure Semantics
 
 - Unreadable PCAP: fail before starting protocol jobs.
+- Output directory already contains a published decode generation: reject with exit `2` (re-runs create a new run directory; published generations are immutable per `LLD.md` section 25).
 - tshark unavailable: fail the command.
 - One protocol absent: continue; mark `absent`.
 - One protocol fails while another succeeds: publish valid artifacts and mark overall `partial`.

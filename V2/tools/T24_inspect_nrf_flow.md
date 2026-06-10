@@ -35,6 +35,13 @@ T24 must not:
 
 ## 4. Python Tool Contract
 
+`InspectNRFFlowRequest` is the internal typed contract that
+`DependencyToolExecutor` constructs from a validated canonical
+`DependencyEvidenceRequest` (`LLD.md` section 17), adding `request_id`,
+`analysis_id` and `initial_packet_id` from approved run state. Routing to T24
+happened on the canonical request's `tool` field; this model intentionally
+carries no redundant dependency-type field.
+
 ```python
 class InspectNRFFlowRequest(BaseModel):
     schema_version: Literal["2.0"] = "2.0"

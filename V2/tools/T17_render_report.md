@@ -94,6 +94,13 @@ Each attempt report includes:
 
 Successful attempts may be summarized more compactly but remain listed.
 
+Every failed/incomplete attempt that was analyzed deterministically but
+skipped by the model-narration policy (`LLD.md` section 28) is explicitly
+disclosed: the attempt carries a `model_narration: "skipped_by_policy"`
+marker with the cap and ordering values that caused the skip, taken from the
+run manifest's `skipped_model_attempt_ids`. Absence of model narrative is
+never presented as absence of analysis.
+
 ## 7. Required Answer Order
 
 For each failed attempt, report in this order:

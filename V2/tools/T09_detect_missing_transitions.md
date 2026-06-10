@@ -20,12 +20,17 @@ T09 must not:
 ## 3. Inputs and Boundary
 
 - One T04 `ProcedureAttempt` with observed transitions.
-- Exact versioned `ProcedureProfile` used for segmentation.
-- `InterfaceVisibility` and capture boundaries.
-- Existing explicit candidates from T06-T08 for suppression/linking.
-- Versioned timeout policy.
+- Exact versioned `ProcedureProfile` used for segmentation, loaded from the
+  profile registry (`profiles/README.md`).
+- Existing explicit candidates from T06-T08 for suppression/linking. T09 runs
+  only after all three explicit detectors for the attempt have published.
+- The shared attempt-scoped `DetectionContext` (`LLD.md` section 11), carrying
+  capture bounds, interface visibility, the T21 phase reader and the resolved
+  timeout-policy handle.
 
-T09 receives primary attempt data only.
+T09 receives primary attempt data only. It is the sole owner of implicit
+missing-transition/missing-response candidates; T07/T08 request-only
+observations are inputs, never duplicated candidates.
 
 ## 4. Python Tool Contract
 
@@ -35,10 +40,8 @@ class DetectMissingTransitionsRequest(BaseModel):
     analysis_id: UUID
     attempt: ProcedureAttempt
     profile: ProcedureProfile
-    visibility: InterfaceVisibility
     explicit_candidates: list[FailureCandidate]
-    capture: CaptureMetadata
-    timeout_policy_version: str
+    context: DetectionContext
 
 
 class DetectMissingTransitionsResult(BaseModel):
@@ -178,6 +181,12 @@ T09 candidate category is `missing_transition` or `procedure_timeout` and includ
 - Existing explicit candidate link.
 
 Suggested base score is `0.65`, increased for strong visibility and elapsed timeout, reduced for partial capture/assignment ambiguity. Explicit T06-T08 candidates generally outrank T09 when they explain the same break.
+
+Per `LLD.md` section 4.6, T09 assigns `severity` from its rule table, resolves
+`capture_phase` through `context.phase_reader`, publishes
+`call_impact="inconclusive"`, persists every score term, and mints cited
+evidence (including synthetic `stage_expectation` records for missing stages)
+through the evidence registry (`LLD.md` section 24).
 
 ## 16. Deterministic IDs and Persistence
 

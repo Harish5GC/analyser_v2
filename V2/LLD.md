@@ -201,6 +201,8 @@ analyze PCAP
   --api-key-env NAME
   --ue SELECTOR
   --attempt UUID
+  --max-model-attempts N
+  --model-attempt-order policy
   --include-nrf-success
   --include-udr-success
   --unmasked-local-evidence
@@ -208,6 +210,11 @@ analyze PCAP
   --config PATH
   --log-level LEVEL
 ```
+
+`--ue` and `--attempt` narrow both deterministic reporting focus and model
+narration. `--max-model-attempts` and `--model-attempt-order` configure the
+model narration policy defined in section 28; they never reduce deterministic
+analysis, which always covers every persisted attempt.
 
 Exit codes:
 
@@ -245,6 +252,10 @@ class HarnessConfig(BaseModel):
     context_frames_after: int = 20
     max_context_frames: int = 500
     max_full_record_bytes: int = 10_000_000
+    max_model_attempts_per_run: int = 5
+    model_attempt_order: Literal[
+        "severity_then_first_frame", "first_frame", "last_frame"
+    ] = "severity_then_first_frame"
 ```
 
 Precedence:
@@ -332,7 +343,7 @@ class IdentityEdge(BaseModel):
     left_value: str
     right_type: str
     right_value: str
-    confidence: float
+    confidence: Decimal
     reason: str
     event_ids: list[UUID]
     valid_from_frame: int
@@ -345,11 +356,25 @@ class UEContext(BaseModel):
     warnings: list[str]
 ```
 
-Confidence thresholds:
+Confidence threshold bands are named, configured T03 values:
 
-- `>= 0.90`: automatic link.
-- `0.70-0.89`: link with warning.
-- `< 0.70`: candidate only; do not merge UE contexts.
+```python
+class IdentityLinkThresholds(BaseModel):
+    auto_link_threshold: Decimal = Decimal("0.90")
+    warning_link_threshold: Decimal = Decimal("0.70")
+```
+
+- `confidence >= auto_link_threshold` and no hard conflict: automatic link.
+- `warning_link_threshold <= confidence < auto_link_threshold`: link with a
+  recorded warning that lowers downstream correlation confidence.
+- `confidence < warning_link_threshold`: candidate only; UE contexts are never
+  merged from candidates.
+
+Validation requires `auto_link_threshold > warning_link_threshold`. These two
+fields replace the former `minimum_auto_link_confidence`; no separate
+auto-link knob exists. Threshold-boundary behavior (exactly `0.90`, exactly
+`0.70`) is fixed by the inclusive lower bound of each band and covered by unit
+tests.
 
 ### 4.5 Procedure attempt
 
@@ -394,13 +419,27 @@ class FailureCandidate(BaseModel):
     cleanup: bool = False
     evidence_ids: list[UUID]
     detector: str
-    detector_score: float
+    detector_score: Decimal
+    score_terms: list[ScoreTerm]
     capture_phase: str
     relevance: Literal["attempt_related", "dependency_related", "startup_background", "concurrent_background", "post_call_background", "unresolved_infrastructure"]
     call_impact: Literal["causal", "contributing", "unrelated", "inconclusive"]
 ```
 
-### 4.7 Root-cause result
+`ScoreTerm` is the named score component defined in section 12; detectors
+persist every base/bonus/penalty term they apply, and `detector_score` is the
+clamped sum of those terms.
+
+Field ownership is fixed; a published candidate is immutable:
+
+| Field | Owner | Rule |
+|---|---|---|
+| `severity` | Emitting detector (T06-T09, T24/T25 adapters) | Assigned from the detector's versioned rule table; never recomputed downstream. |
+| `capture_phase` | Emitting detector | Resolved through the `DetectionContext` phase reader (T21 intervals). |
+| `relevance` | Emitting detector | Defaults to `attempt_related` for attempt-assigned evidence; background/dependency labels per detector rules. |
+| `call_impact` | T23 only | Every primary candidate is published with `call_impact="inconclusive"`. Only a T23 assessment, wrapped by T24/T25 into a new dependency candidate, carries another value. |
+| `detector_score`, `score_terms` | Emitting detector | T12 consumes them as ranking inputs and persists its own `RankedCandidate`; it never mutates the source candidate. |
+| `downstream`, `cleanup` | Emitting detector (initial flags); T12 (final classification) | T12 records its downstream/cleanup conclusions in `RankedCandidate.classification`, not by rewriting the candidate. |
 
 ```python
 class RootCauseResult(BaseModel):
@@ -461,6 +500,32 @@ class UERequest(BaseModel):
     source_event_ids: list[UUID]
     missing_fields: list[str]
 ```
+
+### 4.10 Evidence stage and model pass
+
+Two distinct enums describe the two-generation flow. They are never collapsed
+into one type:
+
+```python
+EvidenceStage = Literal["primary", "dependency_expanded"]
+ModelPass = Literal["initial", "final"]
+```
+
+- `EvidenceStage` labels deterministic evidence generations: T12 rankings,
+  T14 validations and T15 packets.
+- `ModelPass` labels T16 provider invocations only.
+
+Mapping and legal transitions:
+
+| EvidenceStage | Consumed by ModelPass | Transition rule |
+|---|---|---|
+| `primary` | `initial` | Always the first generation. The T15 packet built at stage `primary` is referred to throughout these documents as the "initial packet" because it feeds the initial model pass. |
+| `dependency_expanded` | `final` | Created only through the section 19.3 commit barrier from admitted inspection results. Exactly one final pass per attempt; no further transition exists. |
+
+A `final` pass without a `dependency_expanded` packet is illegal, as is a
+second `dependency_expanded` generation for the same attempt. Artifacts of
+both stages are immutable; the expanded generation references its primary
+parent by revision, never by mutation.
 
 ## 5. Decoder Runner Design
 
@@ -716,7 +781,11 @@ When NF instance ID is unavailable, FQDN/IP/NF type/service may form a lower-con
 
 ## 10. State Machine Definition
 
-Definitions are declarative:
+Definitions are declarative. `profiles/README.md` is the normative registry
+contract for source-file layout, resolution, release/deployment overlays,
+condition facts, compatibility, review and requirement-to-fixture
+traceability. The models below describe the resolved runtime view consumed by
+T04 and T09; tools never load or patch profile YAML directly.
 
 ```python
 class StageDefinition(BaseModel):
@@ -733,6 +802,7 @@ class ProcedureDefinition(BaseModel):
     procedure: ProcedureType
     profile_id: str
     release: str
+    deployment_profile: str
     start_matchers: list[EventMatcher]
     stages: list[StageDefinition]
     allowed_variants: list[list[str]]
@@ -876,6 +946,31 @@ PFCP tunnel changes during handover are expected. The consistency detector compa
 
 ## 11. Detector Interfaces
 
+Every detector receives the same attempt-scoped `DetectionContext`, created by
+the orchestrator (section 19.4). It is the only sanctioned source for capture
+bounds, phase lookup and resolved policy tables inside T06-T09:
+
+```python
+class DetectionContext(BaseModel):
+    analysis_id: UUID
+    attempt_id: UUID
+    capture: CaptureMetadata
+    phase_reader: CapturePhaseReader
+    visibility: InterfaceVisibility
+    assignment_confidence: Literal["high", "medium", "low"]
+    policies: ResolvedPolicySet
+```
+
+- `capture` supplies first/last frame and timestamp so timeout and
+  capture-boundary decisions (for example T08's
+  `request_only_capture_boundary`) have a defined input.
+- `phase_reader` resolves any frame to its T21 interval so every candidate can
+  populate `capture_phase` deterministically.
+- `visibility` is the attempt's persisted T04 interface visibility.
+- `policies` contains the immutable handles produced by the configuration
+  resolver (section 29) for operation policies, cause dictionaries and timeout
+  tables; detectors never receive bare version strings.
+
 ```python
 class FailureDetector(Protocol):
     name: str
@@ -916,18 +1011,60 @@ Scores rank candidates but do not represent statistical probability.
 
 ## 12. Root-Cause Ranking Algorithm
 
-For each candidate:
+This section is the canonical score model; `tools/T12_rank_root_causes.md`
+elaborates eligibility, relations and persistence using exactly these terms.
+
+For each eligible candidate:
 
 ```text
-rank_score = detector_score
+rank_score = detector_base
            + explicit_failure_bonus
+           + exact_attempt_link_bonus
            + cross_protocol_explanatory_bonus
-           + baseline_divergence_bonus
+           + first_divergence_bonus
+           + terminal_explanation_bonus
+           + inspected_dependency_impact_bonus
            - downstream_penalty
            - cleanup_penalty
-           - ambiguous_correlation_penalty
+           - recovered_retry_penalty
+           - assignment_ambiguity_penalty
            - incomplete_capture_penalty
+           - contradiction_penalty
 ```
+
+| Term | Sign | Meaning |
+|---|---|---|
+| `detector_base` | + | Clamped sum of the candidate's detector score terms (sections 11.1-11.3). Replaces the former name `detector_score` in ranking formulas. |
+| `explicit_failure_bonus` | + | Explicit protocol rejection/cause over inferred absence. |
+| `exact_attempt_link_bonus` | + | Exact transaction/identity attempt association. |
+| `cross_protocol_explanatory_bonus` | + | Candidate explains later effects through supported links. |
+| `first_divergence_bonus` | + | Candidate occurs at or explains the T11 first divergence. Replaces the former name `baseline_divergence_bonus`. |
+| `terminal_explanation_bonus` | + | Candidate accounts for the terminal UE effect. |
+| `inspected_dependency_impact_bonus` | + | T23 `causal`/`contributing` impact on an admitted dependency candidate. |
+| `downstream_penalty` | - | Candidate is explained by an earlier supported cause. |
+| `cleanup_penalty` | - | Cleanup/release after the attempt already failed. |
+| `recovered_retry_penalty` | - | Failure followed by successful retry/recovery. |
+| `assignment_ambiguity_penalty` | - | Low-confidence attempt assignment. Replaces the former name `ambiguous_correlation_penalty`. |
+| `incomplete_capture_penalty` | - | Capture boundary weakens the inference. |
+| `contradiction_penalty` | - | Evidence contradicts the candidate's claim. |
+
+Every applied term is persisted as a named `ScoreTerm`:
+
+```python
+class ScoreTerm(BaseModel):
+    name: str
+    value: Decimal
+    rationale_code: str
+    evidence_ids: list[UUID]
+```
+
+`rank_score` is the sum of persisted terms clamped to configured bounds; the
+scalar is derived, never stored without its terms. Weights, bounds and
+thresholds are versioned ranking policy resolved through section 29 and are
+part of the ranking revision hash. Ties are broken by the deterministic order
+in `tools/T12` section 16 (causal dominance, explicit over inferred,
+correlation strength, terminal/divergence explanation, earlier causal stage,
+policy protocol priority, candidate UUID).
 
 Temporal rules:
 
@@ -945,13 +1082,32 @@ The ranker marks a candidate downstream when:
 
 ## 13. Attempt Comparison
 
-Baseline selection:
+Baseline selection is lexicographic. Eligibility filters apply first; ordering
+criteria then compare surviving candidates strictly in sequence, so a later
+criterion can never override an earlier one:
 
-1. Same UE.
-2. Same procedure.
-3. Successful outcome.
-4. Highest request-signature similarity.
-5. Nearest earlier attempt by frame.
+Eligibility (all required):
+
+1. Same resolved UE.
+2. Same procedure/profile family, with the T11 compatibility rules
+   (emergency, access type, roaming topology, handover type).
+3. `outcome=succeeded`.
+4. Earlier than the failed attempt (future-success baselines are a deferred
+   `population_baselines` capability, not a V2 behavior).
+5. Sufficient interface visibility for the compared stages.
+
+Ordering (strict priority):
+
+1. Higher request-signature similarity band. Similarity is computed as a
+   versioned `Decimal` score but compared in configured bands (for example
+   `exact`, `high`, `partial`) so that minor numeric noise cannot outrank the
+   band order.
+2. Within the same band, nearest earlier attempt by frame.
+3. Remaining ties: lowest attempt UUID lexical order.
+
+T11 retains its numeric `baseline_score` and per-component weights for audit
+of every candidate considered, but the score never overrides this lexicographic
+order. `tools/T11_compare_attempts.md` is the elaboration of this contract.
 
 Stage comparison output:
 
@@ -972,30 +1128,21 @@ Dynamic fields excluded from comparison include frame, timestamp, sequence, stre
 
 ## 14. Scenario Models
 
-```python
-class ScenarioSpec(BaseModel):
-    original_text: str
-    target_procedure: str | None
-    expected_outcome: Literal["success", "failure"] | None
-    constraints: dict[str, JsonValue]
-    checkpoints: list[ScenarioCheckpoint]
+Scenario models are owned by the tool specifications and registered in the
+shared-model registry (section 23):
 
-class ScenarioCheckpoint(BaseModel):
-    checkpoint_id: str
-    description: str
-    protocol: str | None
-    matcher: EventMatcher | StateMatcher
-    required: bool = True
+- `ScenarioSpec`, `ScenarioCheckpoint`, `ScenarioSelectors`,
+  `ExpectedRequest`, `ScenarioTextSpan`, `ScenarioConflict`,
+  `ScenarioMatcher`, `ScenarioCondition`, `ScenarioTimeScope` and
+  `CheckpointOrdering` are defined in `tools/T13_parse_scenario.md`
+  section 5a.
+- `CheckpointResult`, `ScenarioAttemptCandidate` and
+  `ScenarioEvidenceConflict` are defined in
+  `tools/T14_validate_scenario.md` sections 6, 7 and 16.
 
-class CheckpointResult(BaseModel):
-    checkpoint_id: str
-    status: Literal["verified", "failed", "inconclusive", "not_applicable"]
-    observed: JsonValue | None
-    evidence_ids: list[UUID]
-    reason: str
-```
-
-The scenario parser prompt must explicitly return `null` for unspecified values. The validator, not the model, decides checkpoint status.
+Invariant: the scenario parser prompt must explicitly return `null` for
+unspecified values, and the validator, not the model, decides checkpoint
+status.
 
 ## 15. Evidence Packet
 
@@ -1003,7 +1150,7 @@ The scenario parser prompt must explicitly return `null` for unspecified values.
 class EvidencePacket(BaseModel):
     schema_version: Literal["2.0"]
     packet_id: UUID
-    pass_stage: Literal["initial", "dependency_expanded"]
+    pass_stage: EvidenceStage
     analysis_id: UUID
     parent_packet_id: UUID | None
     root_cause_revision: str
@@ -1032,7 +1179,14 @@ Token budgeting order:
 5. Baseline details are reduced to first divergence.
 6. Bodies are shortened before any mandatory evidence is removed.
 
-The initial packet cannot contain detailed NRF or UDR events and sets `parent_packet_id=None` with no dependency revisions. A dependency-expanded packet names the exact initial parent packet and may contain only admitted outputs from `inspect_nrf_flow` or `inspect_udr_flow`; its ranking/scenario/dependency revisions must match the section 19.3 lineage. The final packet must still satisfy the configured token budget.
+The packet built at `pass_stage="primary"` is the initial packet (section
+4.10). It cannot contain detailed NRF or UDR events and sets
+`parent_packet_id=None` with no dependency revisions. A dependency-expanded
+packet names the exact initial parent packet and may contain only admitted
+outputs from `inspect_nrf_flow` or `inspect_udr_flow`; its
+ranking/scenario/dependency revisions must match the section 19.3 lineage. The
+expanded packet, consumed by the final model pass, must still satisfy the
+configured token budget.
 
 ### 15.1 Lazy dependency inspectors
 
@@ -1079,26 +1233,63 @@ One repair retry is allowed with only the validation errors and previous respons
 
 ## 17. Model Diagnosis Contract
 
+This section is the canonical definition of the model-facing dependency
+request and the inspection-result union. T16, T23, T24 and T25 reference it.
+
 ```python
+DependencyReasonCode = Literal[
+    "DISCOVERY_FAILURE_SUSPECTED",
+    "NF_REGISTRATION_OR_READINESS_SUSPECTED",
+    "SCP_ROUTING_OR_SELECTION_SUSPECTED",
+    "SUBSCRIBER_DATA_FAILURE_SUSPECTED",
+    "DEPENDENCY_TIMEOUT_SUSPECTED",
+]
+
 class DependencyEvidenceRequest(BaseModel):
     tool: Literal["inspect_nrf_flow", "inspect_udr_flow"]
     attempt_id: UUID
-    reason_code: Literal[
-        "DISCOVERY_FAILURE_SUSPECTED",
-        "NF_REGISTRATION_OR_READINESS_SUSPECTED",
-        "SCP_ROUTING_OR_SELECTION_SUSPECTED",
-        "SUBSCRIBER_DATA_FAILURE_SUSPECTED",
-        "DEPENDENCY_TIMEOUT_SUSPECTED",
-    ]
+    reason_code: DependencyReasonCode
     rationale: str
+    initial_evidence_ids: list[UUID]
     frame_start: int
     frame_end: int
     nf_type: str | None = None
     service_name: str | None = None
     nf_instance_id: str | None = None
+    fqdn: str | None = None
     consumer_nf: str | None = None
     resource_or_operation: str | None = None
+    masked_correlation_key: str | None = None
+```
 
+Routing and adaptation:
+
+- The `tool` field is the only dispatch discriminator. A shared reason code
+  such as `DEPENDENCY_TIMEOUT_SUSPECTED` is unambiguous because routing never
+  depends on the reason code.
+- `DependencyToolExecutor` validates the generic request, then adapts it to
+  the typed internal contract — `InspectNRFFlowRequest` (T24 section 4) or
+  `InspectUDRFlowRequest` (T25 section 4) — adding `request_id`,
+  `analysis_id` and `initial_packet_id` from approved run state. The typed
+  requests carry no redundant dependency-type field; the executor's choice of
+  inspector is the routing.
+- `initial_evidence_ids` is mandatory input to T24/T25 rationale validation:
+  every cited ID must exist in the initial packet and at least one must
+  support the selected reason category.
+
+The inspection-result union consumed by T10, T12, T14, T15, T17 and the
+expansion validator:
+
+```python
+DependencyInspectionResult = NRFInspectionResult | UDRInspectionResult
+```
+
+The union is discriminated by the concrete result type. Consumers that need a
+string discriminator use T23's `dependency_type` (`"NRF"` for
+`NRFInspectionResult`, `"UDR"` for `UDRInspectionResult`); it is derived from
+the type, never stored as an extra field on T24/T25 results.
+
+```python
 class ModelDiagnosis(BaseModel):
     ue_request_summary: str
     outcome_summary: str
@@ -1171,12 +1362,12 @@ class AnalysisReport(BaseModel):
 | T11 | Attempt | T05, T10 and eligible successful attempts | Failed/incomplete diagnostic target. No baseline is a valid result. |
 | T12 primary | Attempt | T06-T09 and optional T11 | Failed/incomplete diagnostic target. |
 | T14 primary | Scenario/run | T13, T04, T05 and T09 | Valid scenario exists. |
-| T15/T16 initial | Attempt | T05, T10-T12 and optional T14 | Provider enabled and attempt selected for model narration. |
+| T15 primary / T16 initial | Attempt | T05, T10-T12 and optional T14 | Provider enabled and attempt selected by the model narration policy (section 28). |
 | T24/T25 | Attempt/request | Schema-valid initial T16 request | Approved bounded dependency request. |
 | T22 | Internal T24 | Approved NRF request | Invoked only by `NRFInspector`. |
 | T23 | Internal T24/T25 | Retrieved bounded dependency evidence | Invoked only inside the selected inspector. |
 | T12/T14 dependency-expanded | Attempt/scenario | Completed T24/T25 results | Dependency results affect ranking or scenario checkpoints. |
-| T15/T16 final | Attempt | Expanded deterministic results | At least one completed dependency result; exactly one final pass. |
+| T15 dependency-expanded / T16 final | Attempt | Expanded deterministic results | At least one admitted dependency result; exactly one final pass. |
 | T18/T19/T20 | On demand | Capability and bounded selector/query | Validated evidence need; T20 only when retained detail is insufficient. |
 | T17 | Run | Completed deterministic stages and any optional outcomes | Mandatory final publication. |
 
@@ -1371,7 +1562,7 @@ def analyze(request: AnalysisRequest) -> AnalysisReport:
             attempt_id = attempt.attempt_id
             initial_packets[attempt_id] = execute_and_publish(
                 manifest,
-                "T15:initial",
+                "T15:primary",
                 lambda: evidence_builder.build_initial(
                     attempt=attempt,
                     request_result=request_results[attempt_id],
@@ -1544,6 +1735,16 @@ Metrics:
 - NRF/UDR partitions are inaccessible to primary detectors and the initial evidence builder.
 - Dependency request validation, window clamping, selector requirements and duplicate rejection.
 - Final model-pass requests are rejected to prevent recursive lookup loops.
+- Identity link bands at exact boundaries (`0.90` auto-links, `0.8999...` warns, `0.70` warns, below `0.70` stays candidate) and `auto_link_threshold > warning_link_threshold` validation.
+- `EvidenceStage`/`ModelPass` legality: final pass without an expanded packet rejected; second expanded generation for one attempt rejected; `primary` packet feeding `final` rejected.
+- Generic `DependencyEvidenceRequest` adaptation to typed T24/T25 requests, including `tool`-based routing with the shared `DEPENDENCY_TIMEOUT_SUSPECTED` reason code and mandatory `initial_evidence_ids` validation.
+- Evidence registry: deterministic `evidence_id` minting, duplicate-mint no-op, divergent-payload collision error, and T18 resolution of every emitted evidence ID with `provider=none`.
+- `FailureCandidate` ownership: detectors emit `call_impact="inconclusive"`; only T23-wrapped dependency candidates carry other values; T12 output never mutates a published candidate.
+- Model narration policy: explicit `--attempt`/`--ue` selection, deterministic ordering modes, cap enforcement and skipped-attempt disclosure in manifest/report.
+- Configuration resolver: missing/invalid/checksum-mismatched policy version fails at startup; resolved handles reach detectors through `DetectionContext`.
+- Revision envelopes: byte-identical revisions for identical inputs; sibling generation on config change; stale parent revision rejected by section 19.3 lineage validation.
+- Baseline selection lexicographic order: higher similarity band beats nearer frame; frame decides only within a band; future success never selected.
+- Every machine-readable issue code emitted by any stage is a registered member of `issue_registry.yaml`; unregistered codes fail validation.
 
 ### 21.2 Integration fixtures
 
@@ -1617,17 +1818,476 @@ Store expected deterministic `report.json` files for fixture captures. Model pro
 
 ## 22. Implementation Sequence
 
-1. Add Go decoder output-directory support, retain the source PCAP, and emit checksummed raw/full HTTP/NAS/PFCP artifacts plus indexes.
-2. Implement canonical models, partitioned JSONL store, NRF/UDR indexes and protocol normalizers.
-3. Implement identity graph and attempt segmentation.
-4. Add the scenario-profile registry and initial, mobility, periodic, emergency and non-3GPP registration profiles.
-5. Add service request, paging, PDU lifecycle, mobility, handover, roaming, deregistration and NF-dependency profiles.
-6. Implement primary protocol detectors and root-cause ranking without NRF/UDR partition access.
-7. Implement the dependency request validator, NRF inspector, UDR inspector and bounded second model pass.
-8. Add baseline comparison and bounded timeline.
-9. Add scenario parser/validator.
-10. Add evidence builder and privacy masking.
-11. Add OpenAI-compatible provider and deterministic fallback.
-12. Add reports, CLI, fixtures and golden integration tests.
+1. Implement the shared foundations first: shared model registry (section 23), evidence registry (section 24), revision envelopes (section 25), issue registry (section 26) and the configuration resolver (section 29).
+2. Add Go decoder output-directory support, retain the source PCAP, and emit checksummed raw/full HTTP/NAS/PFCP artifacts plus indexes.
+3. Implement canonical models, partitioned JSONL store, NRF/UDR indexes and protocol normalizers.
+4. Implement identity graph and attempt segmentation.
+5. Add the scenario-profile registry and initial, mobility, periodic, emergency and non-3GPP registration profiles.
+6. Add service request, paging, PDU lifecycle, mobility, handover, roaming, deregistration and NF-dependency profiles.
+7. Implement primary protocol detectors and root-cause ranking without NRF/UDR partition access.
+8. Implement the dependency request validator, NRF inspector, UDR inspector and bounded second model pass.
+9. Add baseline comparison and bounded timeline.
+10. Add scenario parser/validator.
+11. Add evidence builder and privacy masking.
+12. Add OpenAI-compatible provider and deterministic fallback.
+13. Add reports, CLI, fixtures and golden integration tests.
 
 No model integration should begin before canonical events, attempts and deterministic failure candidates are testable.
+
+## 23. Shared Model Registry
+
+Every model used by more than one tool has exactly one owning module. Tool
+specifications reference these definitions and must not re-declare diverging
+copies. Serialization schemas are generated from the owning module and
+versioned with `schema_version`. Import direction is one way: tool packages
+import from `harness/models/`; `harness/models/` imports nothing from tool
+packages.
+
+| Model | Owner module | Defined in |
+|---|---|---|
+| `SourceRef`, `CanonicalEvent`, `EventIdentifiers` | `models/events.py` | Section 4.1-4.3 |
+| `IdentityEdge`, `UEContext`, `IdentityLinkThresholds` | `models/identity.py` | Section 4.4 |
+| `ProcedureAttempt`, `StateTransition`, `RetryRecord`, `InterfaceVisibility` | `models/attempts.py` | Sections 4.5, 23.1 |
+| `FailureCandidate`, `ScoreTerm`, `TerminalEffect` | `models/failures.py` | Sections 4.6, 12; T07 section 10 |
+| `EvidenceRecord`, `EvidenceCapability`, cursor envelope | `models/evidence.py` | Sections 24, 30 (in tools/T18 until section 30 lands) |
+| `EvidenceStage`, `ModelPass` | `models/common.py` | Section 4.10 |
+| `ArtifactDescriptor`, `CollectionDescriptor` | `models/common.py` | Section 23.2 |
+| `CaptureMetadata`, `FrameWindow`, `PhaseRoll`, `CapturePhaseInterval`, `CapturePhaseLabel` | `models/phases.py` | Section 23.1; T21 sections 5, 12 |
+| `EventMatcher`, `ConditionExpression`, profile models | `models/profiles.py` | Section 23.3; `profiles/README.md` |
+| `DetectionContext`, `ResolvedPolicySet` | `models/detection.py` | Sections 11, 29 |
+| `DependencyEvidenceRequest`, `DependencyReasonCode`, `DependencyInspectionResult` | `models/tool_requests.py` | Section 17 |
+| `DependencyEventSummary`, `DependencyBaselineComparison`, `UDRBaselineComparison` | `models/dependency.py` | Section 23.4 |
+| `NFEntityReadiness`, `ServiceRequirement` | `models/dependency.py` | Section 23.4; T22 section 15 |
+| Scenario models | `models/scenario.py` | Section 14 pointers |
+| `Issue`, issue codes | `errors.py` | Section 26 |
+| `RunManifest`, `AnalysisState`, `ReportPolicy` | `models/reports.py` | Section 27; T17 section 4 |
+| `MaskedUEIdentity`, masking policy models | `evidence/masking.py` | Section 23.5 |
+| `ProblemDetailsSummary`, `MissingField`, `FieldDifference`, `StageAlignment` | `models/common.py` | Section 23.5 |
+
+### 23.1 Attempt and capture support models
+
+```python
+class StateTransition(BaseModel):
+    stage_id: str
+    from_state: str
+    to_state: str
+    event_id: UUID | None
+    frame: int | None
+    occurred_at: Decimal | None
+    reason_codes: list[str] = Field(default_factory=list)
+
+class RetryRecord(BaseModel):
+    retry_ordinal: int
+    event_id: UUID
+    frame: int
+    same_transaction: bool
+    reason_codes: list[str] = Field(default_factory=list)
+
+class InterfaceVisibility(BaseModel):
+    observed: dict[str, Literal["visible", "partial", "not_captured"]]
+    evidence_ids: dict[str, list[UUID]] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
+
+class CaptureMetadata(BaseModel):
+    first_frame: int
+    last_frame: int
+    first_timestamp: Decimal | None
+    last_timestamp: Decimal | None
+    packet_count: int
+    source_sha256: str
+
+class FrameWindow(BaseModel):
+    frame_start: int
+    frame_end: int
+
+class PhaseRoll(BaseModel):
+    pre_frames: int
+    post_frames: int
+    pre_seconds: Decimal | None = None
+    post_seconds: Decimal | None = None
+```
+
+Interface keys in `InterfaceVisibility.observed` come from the release/profile
+visibility registry (section 10.3), not a hard-coded enum.
+
+### 23.2 Artifact and collection descriptors
+
+```python
+class ArtifactDescriptor(BaseModel):
+    artifact_id: UUID
+    relative_path: str
+    artifact_type: str
+    protocol: str | None = None
+    media_type: str
+    format_schema_version: str
+    sha256: str
+    byte_size: int
+    record_count: int | None = None
+    creation_stage: str
+    parent_source_sha256: str | None = None
+
+class CollectionDescriptor(BaseModel):
+    collection_id: UUID
+    relative_dir: str
+    artifact_type: str
+    index_artifact: ArtifactDescriptor
+    member_count: int
+    members_sha256: str
+```
+
+`relative_path`/`relative_dir` are run-directory relative, must not contain
+`..` or absolute components, and are validated before any read/write. For a
+collection (for example HTTP/2 stream documents), `index_artifact` is the
+ordered child index whose entries each carry the member checksum and size;
+`members_sha256` is the checksum over the ordered index entries. Validation of
+a collection requires validating the index and every referenced member.
+
+### 23.3 Matchers and conditions
+
+```python
+class EventMatcher(BaseModel):
+    protocol: str | None = None
+    message_types: list[str] = Field(default_factory=list)
+    outcome: str | None = None
+    attribute_equals: dict[str, JsonValue] = Field(default_factory=dict)
+    identifier_present: list[str] = Field(default_factory=list)
+
+class ConditionExpression(BaseModel):
+    op: Literal["and", "or", "not", "eq", "ne", "present", "absent", "in"]
+    fact: str | None = None
+    value: JsonValue | None = None
+    children: list["ConditionExpression"] = Field(default_factory=list)
+```
+
+Facts are allowlisted attempt/request/visibility/profile keys published in
+`profiles/README.md`. Arbitrary code, regex bodies and JSONPath are forbidden
+in both models.
+
+### 23.4 Dependency support models
+
+```python
+class DependencyEventSummary(BaseModel):
+    event_id: UUID
+    frame: int
+    timestamp: Decimal | None
+    operation: str
+    status_or_cause: str | None
+    entity_or_context: str | None
+    phase: str
+    evidence_ids: list[UUID]
+
+class DependencyBaselineComparison(BaseModel):
+    comparison_id: UUID
+    failed_operation_evidence_ids: list[UUID]
+    baseline_operation_evidence_ids: list[UUID]
+    status_changed: bool
+    structure_changed: bool
+    retry_count_changed: bool
+    propagation_outcome_changed: bool
+    rationale_codes: list[str]
+
+class UDRBaselineComparison(DependencyBaselineComparison):
+    consumer_nf: str | None
+    data_category: str | None
+    masked_context_equal: bool | None
+
+class ServiceRequirement(BaseModel):
+    service_name: str
+    api_version: str | None = None
+    required_by_stage: str | None = None
+
+class NFEntityReadiness(BaseModel):
+    entity_id: UUID
+    service_states: dict[str, str]
+    status: Literal["ready", "not_ready", "partially_ready", "unknown"]
+    evidence_ids: list[UUID]
+```
+
+`DependencyBaselineComparison` is the common base used by T23;
+`UDRBaselineComparison` is its only specialization (T25). The two names in
+earlier drafts referred to this single hierarchy.
+
+### 23.5 Report-facing support models
+
+```python
+class MaskedUEIdentity(BaseModel):
+    ue_alias: str
+    masked_forms: dict[str, str] = Field(default_factory=dict)
+
+class ProblemDetailsSummary(BaseModel):
+    status: int | None
+    cause: str | None
+    title: str | None
+    detail_excerpt: str | None
+    invalid_params: list[str] = Field(default_factory=list)
+    parse_state: str
+
+class MissingField(BaseModel):
+    name: str
+    reason_code: str
+    visibility: str
+    checked_event_ids: list[UUID]
+    recoverable_via: Literal["T18", "T20", "none"]
+
+class FieldDifference(BaseModel):
+    field_name: str
+    failed_value: JsonValue | None
+    baseline_value: JsonValue | None
+    category: str
+
+class StageAlignment(BaseModel):
+    stage_id: str
+    occurrence: int
+    status: Literal["matched", "changed", "missing_in_failed", "extra_in_failed", "not_comparable"]
+    evidence_ids: list[UUID]
+```
+
+The typed warning aliases that appear in tool contracts (`DecodeWarning`,
+`NormalizationWarning`, `IdentityWarning`, `AttemptWarning`,
+`DetectorWarning`) are all the single `Issue` model of section 26 carrying a
+tool-scoped code namespace; they are type aliases, not separate classes.
+
+## 24. Evidence Registry
+
+The evidence registry defines evidence identity once for the whole harness.
+Evidence must resolve through T18 without T15 and without any model provider.
+
+### 24.1 Canonical record
+
+```python
+class EvidenceRecord(BaseModel):
+    schema_version: Literal["2.0"] = "2.0"
+    evidence_id: UUID
+    analysis_id: UUID
+    record_type: str
+    protocol: str | None
+    source_event_ids: list[UUID]
+    frames: list[int]
+    source_refs: list[SourceRef]
+    observed: dict[str, JsonValue]
+    minted_by: str
+    revision_scope: str
+```
+
+### 24.2 Identity and minting
+
+- `evidence_id = UUIDv5(analysis_id, canonical(sorted(source_event_ids)) +
+  record_type + revision_scope)`.
+- `revision_scope` is the revision (section 25) of the artifact generation the
+  record belongs to, so re-extraction under changed config yields a new ID
+  rather than silently rebinding an old one.
+- The tool that first cites evidence mints the record at detection/extraction
+  time through one shared helper in `evidence/registry.py`. T06-T09 mint for
+  primary candidates; T05 for request provenance; T11/T14 for
+  comparison/checkpoint citations; T22-T25 for dependency evidence; T19/T20
+  register derived-context records. T15 selects and re-serializes existing
+  records; it never mints.
+- `record_type` values are registered semantic types (for example
+  `http_transaction`, `nas_message`, `pfcp_transaction`, `stage_expectation`,
+  `nf_lifecycle_event`, `udr_transaction`, `derived_context`,
+  `derived_redecode`).
+
+### 24.3 Storage, deduplication and resolution
+
+- Records append to `normalized/evidence/evidence_records.jsonl`; the storage
+  layer maintains `indexes/evidence_index.jsonl` mapping `evidence_id` to
+  byte offset, source events and source refs.
+- Minting the same identity twice is a no-op when the payload hash matches and
+  an evidence-integrity error when it differs (collision with divergent
+  content).
+- T18 resolves `evidence_id -> evidence index -> source events/records`
+  exactly as its section 7 chain describes; report evidence references resolve
+  in `provider=none` runs.
+- Records are immutable once the owning generation publishes; superseding
+  generations mint new IDs through `revision_scope`.
+
+## 25. Revision Model
+
+A revision identifies one immutable generation of a tool's output.
+
+### 25.1 Envelope
+
+```python
+class RevisionEnvelope(BaseModel):
+    revision: str
+    tool: str
+    tool_version: str
+    schema_version: str
+    config_hash: str
+    policy_versions: dict[str, str]
+    input_checksums: dict[str, str]
+    parent_revisions: dict[str, str]
+    created_in_stage: str
+```
+
+- `revision = "sha256:" + hex(sha256(canonical_serialization(envelope minus
+  revision)))`. Canonical serialization is UTF-8 JSON with sorted keys and
+  Decimal-as-string.
+- Every artifact-producing tool exposes its `revision` in its result and
+  manifest (this adds an explicit `revision: str` to results that predate the
+  rule, including T04's `SegmentAttemptsResult`).
+- Consumers record the exact input revisions they used in their own
+  `parent_revisions`, which is how section 19.3 lineage validation works.
+
+### 25.2 Rules
+
+- Same inputs, configuration and versions produce byte-identical revisions on
+  any supported machine.
+- A producer never overwrites a published revision; changed
+  inputs/config/policy create a sibling generation. Staging plus manifest-last
+  publication (already required per tool) is the only legal publication
+  sequence.
+- Each tool mints its own revision; no caller mints on a tool's behalf. T01
+  participates like every other tool: re-decoding into a run directory that
+  already contains a published decode generation is rejected rather than
+  merged.
+- Compatibility: consumers must reject a parent revision whose
+  `schema_version` they do not support, and must surface—not silently
+  upgrade—mixed-generation lineages.
+
+## 26. Issue Registry
+
+All machine-readable warnings and errors use one registered vocabulary.
+
+```python
+class Issue(BaseModel):
+    code: str
+    severity: Literal["info", "warning", "error", "critical"]
+    stage: str
+    attempt_id: UUID | None = None
+    evidence_ids: list[UUID] = Field(default_factory=list)
+    message: str
+    retryable: bool = False
+```
+
+- Codes are uppercase snake case, namespaced by owning stage/tool prefix:
+  `T02_VALUE_PARSE_FAILED`, `T02_AMBIGUOUS_DEPENDENCY_PARTITION`,
+  `T15_EVIDENCE_BUDGET_EXCEEDED`, `RUN_EVIDENCE_INTEGRITY`,
+  `RUN_ACCESS_BOUNDARY`. Cross-tool recurring conditions own `RUN_`-prefixed
+  codes so "evidence-integrity" and "access-boundary" are single codes
+  everywhere.
+- The registry lives at `harness/config/issue_registry.yaml`: code, owner,
+  severity bounds, message template, remediation hint and aggregation
+  behavior (whether repeated instances collapse in reports).
+- Emitting an unregistered code is a validation error in tests (section
+  21.1). Free-text human messages remain allowed; machine `code` values must
+  be registered.
+- Existing per-spec code mentions map onto this namespace
+  (`VALUE_PARSE_FAILED -> T02_VALUE_PARSE_FAILED`, lowercase completion-state
+  strings in T01/T06 are state values, not issue codes).
+
+## 27. Run Manifest and Analysis State
+
+### 27.1 Run manifest
+
+`manifest.json` at the run root is the orchestrator's authoritative stage
+ledger, written through staged updates and finalized last:
+
+```python
+class StageInvocation(BaseModel):
+    stage_key: str
+    tool: str
+    scope: Literal["run", "attempt", "request", "internal"]
+    attempt_id: UUID | None
+    request_id: UUID | None
+    status: str
+    revision: str | None
+    artifacts: list[ArtifactDescriptor]
+    issues: list[Issue]
+    started_at: datetime
+    elapsed_ms: int
+
+class RunManifest(BaseModel):
+    schema_version: Literal["2.0"]
+    analysis_id: UUID
+    config_hash: str
+    invocations: list[StageInvocation]
+    selected_model_attempt_ids: list[UUID]
+    skipped_model_attempt_ids: list[UUID]
+    dependency_request_ledger: list[DependencyRequestOutcome]
+    publication: Literal["in_progress", "finalized", "failed"]
+```
+
+`stage_key` matches the section 19.4 keys (`T12:primary`,
+`T15:dependency_expanded`, nested T22/T23 invocations). Each invocation's
+`status` uses its tool's documented status vocabulary; the manifest does not
+flatten them into one enum.
+
+### 27.2 Analysis state
+
+`AnalysisState` is the validated in-memory aggregate T17 consumes; it is
+assembled from published artifacts only:
+
+```python
+class AnalysisState(BaseModel):
+    analysis_id: UUID
+    manifest: RunManifest
+    capture: CaptureMetadata
+    attempts: list[ProcedureAttempt]
+    requests: dict[UUID, UERequestResult]
+    explicit_results: dict[UUID, ExplicitDetectorResults]
+    missing_results: dict[UUID, DetectMissingTransitionsResult]
+    timelines: dict[UUID, AttemptTimelineResult]
+    comparisons: dict[UUID, CompareAttemptsResult]
+    primary_roots: dict[UUID, RootCauseResult]
+    expanded_roots: dict[UUID, RootCauseResult]
+    scenario: ValidateScenarioResult | None
+    dependency_results: dict[UUID, list[DependencyInspectionResult]]
+    dependency_outcomes: dict[UUID, list[DependencyRequestOutcome]]
+    diagnoses: dict[UUID, GenerateDiagnosisResult]
+```
+
+### 27.3 Run-status aggregation
+
+Run status is derived from stage criticality, not from a universal stage
+enum. T17 section 10 holds the canonical mapping; in summary: failure of a
+critical chain stage (T01 unusable, storage publication, report write) makes
+the run `failed`; partial/absent protocols, detector partials, scenario or
+provider failures, rejected dependency requests and `unknown` phase visibility
+make it `partial`; everything required complete makes it `success` even when
+every analyzed call failed.
+
+## 28. Model Narration Policy
+
+Deterministic analysis always covers every persisted attempt. The narration
+policy chooses which failed/incomplete attempts additionally receive model
+passes:
+
+1. When `--attempt` is supplied, narrate exactly those attempts (if eligible).
+2. Otherwise, when `--ue` is supplied, restrict eligibility to that UE's
+   failed/incomplete attempts.
+3. Eligible attempts are ordered by `model_attempt_order`:
+   `severity_then_first_frame` (default; highest deterministic primary
+   severity, then earliest start frame), `first_frame`, or `last_frame`.
+4. The first `max_model_attempts_per_run` attempts are selected. Ordering and
+   selection are deterministic for identical inputs.
+
+`model_attempt_selector.select(...)` in section 19.4 implements exactly this.
+Selected and skipped attempt IDs are recorded in the run manifest, and T17
+must disclose attempts that were analyzed deterministically but skipped by the
+narration cap, including the policy values that caused the skip.
+
+## 29. Configuration and Policy Resolver
+
+All `*_version` strings (operation policies, cause dictionaries, timeout
+tables, partition rules, ranking/comparison/phase policies, profile registry)
+are resolved once at run startup into immutable handles:
+
+```python
+class ResolvedPolicy(BaseModel):
+    name: str
+    version: str
+    sha256: str
+    payload: JsonValue
+
+class ResolvedPolicySet(BaseModel):
+    policies: dict[str, ResolvedPolicy]
+```
+
+- Resolution validates each policy file against its schema, records its
+  checksum, and fails the run (`exit 2`) for a missing, schema-invalid or
+  checksum-mismatched version. There is no lazy mid-run policy loading.
+- Tools receive `ResolvedPolicy` handles via `DetectionContext.policies` or
+  their request models; they never load files from bare version strings.
+- The resolved set's name/version/checksum triples enter every revision
+  envelope (`policy_versions`), making policy drift visible in lineage.

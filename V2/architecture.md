@@ -111,7 +111,7 @@ The orchestrator owns run lifecycle and composes tools as a dependency graph. It
 | Timeline and baseline | T10, then T11 | T10 builds primary timelines for every attempt. T11 runs for failed/incomplete attempts when eligible earlier successes exist. |
 | Primary determination | T12 | Ranks only candidates belonging to the current failed/incomplete attempt. |
 | Optional scenario validation | T14 | Runs only when T13 produced a scenario; primary validation uses T04/T05/T09 and primary evidence. |
-| Optional model pass | T15 -> T16 | Runs only for configured failed/incomplete attempts when a provider is enabled. Initial T15 packets are primary-only. |
+| Optional model pass | T15 -> T16 | Runs only for failed/incomplete attempts selected by the deterministic model-narration policy (explicit selectors, configured ordering, per-run cap) when a provider is enabled. Initial T15 packets are primary-only. Attempts skipped by the cap are disclosed in the report. |
 | Optional dependency inspection | T24/T25, with T22/T23 internal | Runs only for schema-valid initial T16 requests. T22 is internal to T24; T23 is internal to T24/T25. The executor grants scoped NRF/UDR readers only after validation. |
 | Dependency-expanded determination | T12 and applicable T14, then T15 -> T16 | Returned dependency results are deterministic inputs. Ranking and applicable scenario checkpoints are revised before the expanded packet and single final model pass. |
 | On-demand forensic support | T18 -> T19 -> T20 as needed | Capability-scoped lookup/context/re-decode services run only for a validated evidence need. T20 is never directly model-callable. |

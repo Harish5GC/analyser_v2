@@ -48,10 +48,12 @@ class CompareAttemptsResult(BaseModel):
 
 A baseline must:
 
-- Belong to the same resolved UE, unless policy explicitly permits a population baseline later.
+- Belong to the same resolved UE. Population baselines are a deferred
+  `population_baselines` capability, not a V2 behavior.
 - Use the same procedure/profile family.
 - Have `outcome=succeeded`.
-- Precede the failed attempt in V2.1.
+- Precede the failed attempt. Future-success baselines belong to the same
+  deferred capability.
 - Have sufficient interface visibility for compared stages.
 - Match emergency/non-emergency and relevant access context.
 - Match roaming topology/fault-domain expectations where applicable.
@@ -83,7 +85,21 @@ Dynamic values excluded by default:
 
 A detector/profile can mark a normally dynamic value relevant, such as unexpected reuse of a SEID, but it must give a reason code.
 
-## 7. Baseline Scoring
+## 7. Baseline Selection and Audit Scoring
+
+Selection among eligible candidates is lexicographic, per the canonical
+contract in `LLD.md` section 13. A later criterion can never override an
+earlier one:
+
+1. Higher request-signature similarity band. Similarity is computed as a
+   versioned `Decimal` and mapped into configured bands (for example `exact`,
+   `high`, `partial`); candidates are compared band-first so numeric noise
+   cannot outrank the band order.
+2. Within the same band, nearest earlier attempt by frame.
+3. Remaining ties: lowest attempt UUID lexical order.
+
+For audit, every considered candidate also retains a numeric score and its
+components:
 
 ```text
 baseline_score = same_profile_weight
@@ -96,7 +112,8 @@ baseline_score = same_profile_weight
                - missing_data_penalty
 ```
 
-Weights are versioned. Ties resolve by nearest earlier frame, then attempt UUID.
+Weights are versioned. `baseline_score` exists for transparency and candidate
+review only; it never overrides the lexicographic order above.
 
 The selected baseline and all rejected top candidates retain score components/reasons for audit.
 
@@ -169,7 +186,7 @@ For a tenth failed establishment after nine successes:
 - Do not aggregate all nine into model context.
 - Record whether the failure is a one-off divergence or follows a trend in retry/timing outcomes.
 
-Population/statistical trend analysis is outside V2.1.
+Population/statistical trend analysis belongs to the deferred `population_baselines` capability.
 
 ## 13. Procedure-Specific Rules
 
@@ -307,7 +324,7 @@ V2/harness/models/
 
 - Frame/SEID/TEID changes alone do not create divergence.
 - Different UE is not selected.
-- Future success is not selected in V2.1.
+- Future success is never selected; the `population_baselines` capability is deferred.
 - Hidden NRF/UDR traffic is not compared.
 
 ## 25. Acceptance Criteria

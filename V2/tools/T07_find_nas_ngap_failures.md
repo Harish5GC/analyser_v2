@@ -11,7 +11,11 @@ T07 emits candidates and terminal-effect metadata. T12 performs final root-cause
 T07 must not:
 
 - Treat every NAS reject as the primary root cause.
-- Infer missing transitions; T09 handles implicit failures.
+- Emit implicit missing-transition or missing-response candidates. T09 is the
+  sole owner of implicit absence detection (including its `0.65`
+  missing-response base score). T07 records an initiating message whose
+  expected outcome is absent as a request-only observation/terminal-effect
+  input for T09, never as its own candidate.
 - Read NRF/UDR partitions.
 - Decode encrypted NAS beyond fields exposed by T02/T18.
 - Apply user scenario expectations.
@@ -23,8 +27,10 @@ Inputs:
 
 - One T04 `ProcedureAttempt`.
 - Attempt-assigned NAS and NGAP events from `PrimaryEventReader`.
-- Applicable procedure profile and interface visibility.
-- Versioned NAS/NGAP cause dictionaries and rule tables.
+- The applicable procedure profile.
+- The shared attempt-scoped `DetectionContext` (`LLD.md` section 11), carrying
+  capture bounds, the T21 phase reader, interface visibility, assignment
+  confidence and the resolved NAS/NGAP cause-dictionary handles.
 
 The detector may read exact full evidence through T18 for fields already referenced by assigned events, but cannot perform broad context lookup or re-decode.
 
@@ -37,8 +43,7 @@ class FindNASNGAPFailuresRequest(BaseModel):
     attempt: ProcedureAttempt
     event_ids: list[UUID]
     profile: ProcedureProfile
-    visibility: InterfaceVisibility
-    cause_dictionary_version: str
+    context: DetectionContext
 
 
 class FindNASNGAPFailuresResult(BaseModel):
@@ -215,12 +220,19 @@ Suggested base values:
 - NGAP unsuccessful outcome with cause: `0.95`.
 - Explicit NAS reject with cause: `0.90`.
 - NAS Non Delivery/Error Indication: `0.85`.
-- Explicit protocol/state status failure: `0.80`.
+- Explicit 5GMM/5GSM Status protocol/state failure: `0.80`.
 - Cause missing/partial: confidence penalty.
 - Terminal event after supported upstream cause: downstream penalty applied by T12.
 - Capture/interface ambiguity: penalty.
 
-Store each score term and rule ID. Scores are ranking inputs, not probabilities.
+T07 has no missing-response base score: the `0.65` implicit-absence base
+belongs exclusively to T09, which consumes T07's request-only observations.
+
+Store each score term and rule ID. Scores are ranking inputs, not
+probabilities. Per `LLD.md` section 4.6, T07 assigns `severity` from its rule
+table, resolves `capture_phase` through `context.phase_reader`, publishes
+`call_impact="inconclusive"`, and mints cited evidence through the evidence
+registry (`LLD.md` section 24). Published candidates are immutable.
 
 ## 17. Cause Dictionary Management
 

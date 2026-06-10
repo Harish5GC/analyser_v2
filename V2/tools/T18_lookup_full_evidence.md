@@ -109,12 +109,15 @@ HTTP content preserves ordered duplicate headers and body segments; NGAP/NAS pre
 Resolution chain examples:
 
 - Event ID -> T02 event -> `SourceRef` -> T01 document/JSONL record.
-- Evidence ID -> evidence index -> source event/record refs.
+- Evidence ID -> evidence registry index (`indexes/evidence_index.jsonl`, `LLD.md` section 24) -> source event/record refs.
 - Candidate ID -> T06-T12 candidate -> evidence IDs -> records.
 - Attempt ID -> T04 event assignments -> records, subject to bounds/capability.
 - Frame -> frame index -> all records/events on frame.
 
-Every step validates analysis ID and revision/checksum.
+Every step validates analysis ID and revision/checksum. Evidence IDs are
+minted at detection/extraction time per the evidence registry contract, so
+every evidence reference — including report references in `provider=none`
+runs — resolves without T15 ever having executed.
 
 ## 8. Protocol-Specific Lookup
 

@@ -50,7 +50,8 @@ class IdentityGraphConfig(BaseModel):
     supporting_signal_window_seconds: Decimal = Decimal("5")
     context_idle_timeout_seconds: Decimal = Decimal("30")
     max_candidate_edges_per_observation: int = 20
-    minimum_auto_link_confidence: Decimal = Decimal("0.75")
+    auto_link_threshold: Decimal = Decimal("0.90")
+    warning_link_threshold: Decimal = Decimal("0.70")
     sensitive_hash_key_id: str
 
 
@@ -221,7 +222,21 @@ confidence = exact_signal_score
 
 Scores are clamped to `[0, 1]`. Confidence is evidence quality, not statistical probability.
 
-Auto-link requires the configured threshold and no hard conflict. Lower-scoring candidates are persisted as ambiguous edges for later inspection.
+Link decisions use the named bands defined in `LLD.md` section 4.4
+(`IdentityLinkThresholds`); both bounds are validated with
+`auto_link_threshold > warning_link_threshold`:
+
+- `confidence >= auto_link_threshold` (default `0.90`) and no hard conflict:
+  edge is accepted automatically.
+- `warning_link_threshold <= confidence < auto_link_threshold` (default
+  `0.70-0.89`): edge is accepted with a persisted warning that lowers
+  downstream correlation confidence.
+- `confidence < warning_link_threshold`: candidate only. Candidates are
+  persisted as ambiguous edges, never union components, and never merge UE
+  contexts.
+
+A hard conflict blocks acceptance in every band and routes the edge through
+conflict resolution (section 13).
 
 ## 10. Validity Intervals
 
@@ -404,6 +419,7 @@ V2/harness/models/
 - Identifier normalization and scope.
 - Exact, strong, supporting rule gating.
 - Confidence thresholds and deterministic ties.
+- Band boundaries: exactly `auto_link_threshold` auto-links, just below it warns, exactly `warning_link_threshold` warns, just below it stays candidate; config validation rejects `auto_link_threshold <= warning_link_threshold`.
 - Validity open/close/expiry.
 - UUID stability.
 - Sensitive hashing and masking.

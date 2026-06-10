@@ -22,7 +22,10 @@ T08 must not:
 - One T04 attempt and related session/context identities.
 - Attempt-assigned PFCP events from `PrimaryEventReader`.
 - Relevant NGAP/NAS/primary SBI event summaries for consistency checks.
-- PFCP message/cause dictionaries and timeout policy.
+- The shared attempt-scoped `DetectionContext` (`LLD.md` section 11), carrying
+  capture bounds (required for `request_only_capture_boundary` and timeout
+  decisions), the T21 phase reader, interface visibility and the resolved
+  PFCP message/cause/timeout policy handles.
 
 T08 may use T18 for exact PFCP IEs referenced by assigned events. It cannot request broad packet context itself.
 
@@ -35,7 +38,7 @@ class FindPFCPFailuresRequest(BaseModel):
     attempt: ProcedureAttempt
     pfcp_event_ids: list[UUID]
     correlated_event_ids: list[UUID]
-    policy_version: str
+    context: DetectionContext
 
 
 class FindPFCPFailuresResult(BaseModel):
@@ -190,7 +193,11 @@ Suggested bases:
 - Low pairing confidence or capture boundary: penalty.
 - Cleanup operation after terminal attempt: cleanup penalty in T12.
 
-Store all score terms and rule IDs.
+Store all score terms and rule IDs. Per `LLD.md` section 4.6, T08 assigns
+`severity` from its rule table, resolves `capture_phase` through
+`context.phase_reader`, publishes `call_impact="inconclusive"`, and mints
+cited evidence through the evidence registry (`LLD.md` section 24). Published
+candidates are immutable.
 
 ## 15. Attempt Association
 

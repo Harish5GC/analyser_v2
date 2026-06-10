@@ -71,6 +71,96 @@ class ScenarioSpec(BaseModel):
     notes: list[str]
 ```
 
+### 5a. Nested Scenario Schemas
+
+T13 owns these models; they are registered in the shared-model registry
+(`LLD.md` section 23) and reused unchanged by T14.
+
+```python
+class ScenarioSelectors(BaseModel):
+    ue_id: UUID | None = None
+    attempt_id: UUID | None = None
+    masked_subscriber_alias: str | None = None
+    amf_ue_ngap_id: str | None = None
+    ran_ue_ngap_id: str | None = None
+    pdu_session_id: int | None = None
+    frame_start: int | None = None
+    frame_end: int | None = None
+    time_start: Decimal | None = None
+    time_end: Decimal | None = None
+
+
+class ExpectedRequest(BaseModel):
+    dnn: str | None = None
+    snssai: SNSSAI | None = None
+    pdu_type: str | None = None
+    ssc_mode: str | None = None
+    registration_type: str | None = None
+    service_type: str | None = None
+    access_type: str | None = None
+    emergency: bool | None = None
+    roaming_topology: str | None = None
+
+
+class ScenarioTimeScope(BaseModel):
+    frame_start: int | None = None
+    frame_end: int | None = None
+    time_start: Decimal | None = None
+    time_end: Decimal | None = None
+    description_span: ScenarioTextSpan | None = None
+
+
+class ScenarioTextSpan(BaseModel):
+    start_offset: int
+    end_offset: int
+    quoted_text: str
+    rule_id: str
+
+
+class ScenarioConflict(BaseModel):
+    field_name: str
+    values: list[JsonValue]
+    spans: list[ScenarioTextSpan]
+    resolution: Literal["deterministic_wins", "later_phrase", "unresolved"]
+    reason: str
+
+
+class ScenarioMatcher(BaseModel):
+    protocol: str | None = None
+    message_type: str | None = None
+    stage_id: str | None = None
+    field: str | None = None
+    operator: Literal["eq", "ne", "present", "absent", "in"]
+    value: JsonValue | None = None
+
+
+class ScenarioCondition(BaseModel):
+    fact: str
+    operator: Literal["eq", "ne", "present", "absent", "in"]
+    value: JsonValue | None = None
+
+
+class CheckpointOrdering(BaseModel):
+    first_checkpoint_id: str
+    second_checkpoint_id: str
+    constraint: Literal[
+        "before", "immediately_before", "at_least_n_between", "no_forbidden_between"
+    ]
+    count: int | None = None
+```
+
+Validation limits: at most 64 checkpoints, 16 ordering constraints and 16
+forbidden events per scenario; matcher `field` and condition `fact` values
+must come from the allowlisted vocabulary published in `profiles/README.md`;
+span offsets must fall inside the original text; `pdu_session_id` selectors
+require an accompanying UE/attempt/time scope (PDU session ID is never a sole
+selector).
+
+Masking modes: under `provider_mode=openrouter`, subscriber-bearing selectors
+are replaced by masked aliases before any remote call (fail-closed). Under
+`provider_mode=local`, the configured local masking policy applies; clear
+selectors never leave the local trust boundary in either mode.
+
 ## 6. Supported Explicit Expectations
 
 - Procedure/profile/subtype.

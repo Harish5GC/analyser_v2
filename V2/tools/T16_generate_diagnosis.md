@@ -34,7 +34,7 @@ class GenerateDiagnosisRequest(BaseModel):
     analysis_id: UUID
     attempt_id: UUID
     packet: EvidencePacket
-    pass_stage: Literal["initial", "final"]
+    pass_stage: ModelPass
     provider_config: ProviderConfig
 
 
@@ -42,13 +42,17 @@ class GenerateDiagnosisResult(BaseModel):
     schema_version: Literal["2.0"]
     attempt_id: UUID
     packet_id: UUID
-    pass_stage: Literal["initial", "final"]
+    pass_stage: ModelPass
     status: Literal["success", "failed", "disabled"]
     diagnosis: ModelDiagnosis | None
     provider: ProviderMetadata | None
     validation_errors: list[ModelValidationError]
     warnings: list[str]
 ```
+
+`pass_stage` uses the shared `ModelPass` enum (`LLD.md` section 4.10). The
+legal pairing is fixed there: `initial` consumes a `primary`-stage packet;
+`final` consumes a `dependency_expanded`-stage packet.
 
 ## 5. Provider Interface
 
@@ -110,6 +114,12 @@ Reasoning steps cite candidate/evidence IDs and separate observation from infere
 
 ## 8. Dependency Evidence Request Schema
 
+`DependencyEvidenceRequest` and `DependencyReasonCode` are canonical in
+`LLD.md` section 17, including the `fqdn` selector; the model below mirrors
+that definition. Routing is by the `tool` field only, and
+`DependencyToolExecutor` adapts a validated generic request into the typed
+`InspectNRFFlowRequest`/`InspectUDRFlowRequest` internal contracts.
+
 ```python
 class DependencyEvidenceRequest(BaseModel):
     tool: Literal["inspect_nrf_flow", "inspect_udr_flow"]
@@ -122,6 +132,7 @@ class DependencyEvidenceRequest(BaseModel):
     nf_type: str | None = None
     service_name: str | None = None
     nf_instance_id: str | None = None
+    fqdn: str | None = None
     consumer_nf: str | None = None
     resource_or_operation: str | None = None
     masked_correlation_key: str | None = None

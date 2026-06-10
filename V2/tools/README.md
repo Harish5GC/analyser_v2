@@ -43,6 +43,11 @@ Each specification defines the tool-specific subset of:
 
 Cross-tool invariants remain defined in `../architecture.md` and `../LLD.md`, especially primary versus NRF/UDR reader isolation and the single bounded dependency-evidence round.
 
+The T04-owned procedure-profile subsystem has one normative registry contract
+at `../profiles/README.md`. T04 and T09 consume only the immutable resolved
+profiles returned by that subsystem through the central configuration
+resolver; the profile registry is not a model-callable tool.
+
 ## Review Quality Bar
 
 Each reviewed specification must include, where applicable:

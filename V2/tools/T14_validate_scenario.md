@@ -30,6 +30,9 @@ Initial validation uses primary evidence only. Dependency checkpoints may remain
 
 ## 4. Python Tool Contract
 
+`EvidenceStage` is imported from the shared `models/common.py` definition in
+`LLD.md` section 4.10; T14 does not redeclare the enum.
+
 ```python
 class ValidateScenarioRequest(BaseModel):
     schema_version: Literal["2.0"] = "2.0"
@@ -37,7 +40,7 @@ class ValidateScenarioRequest(BaseModel):
     scenario: ScenarioSpec
     explicit_attempt_id: UUID | None
     dependency_results: list[DependencyInspectionResult] = Field(default_factory=list)
-    pass_stage: Literal["primary", "dependency_expanded"]
+    pass_stage: EvidenceStage
     primary_validation_revision: str | None = None
     validator_policy_version: str
 
@@ -51,7 +54,7 @@ class ValidateScenarioResult(BaseModel):
     overall_status: Literal["verified", "failed", "inconclusive", "not_applicable"]
     conflicts: list[ScenarioEvidenceConflict]
     warnings: list[str]
-    pass_stage: Literal["primary", "dependency_expanded"]
+    pass_stage: EvidenceStage
     parent_validation_revision: str | None
     dependency_result_revisions: list[str]
     validation_revision: str

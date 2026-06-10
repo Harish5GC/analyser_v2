@@ -66,7 +66,7 @@ class EvidencePacket(BaseModel):
     schema_version: Literal["2.0"]
     packet_id: UUID
     analysis_id: UUID
-    pass_stage: Literal["initial", "dependency_expanded"]
+    pass_stage: EvidenceStage
     task: Literal["diagnose_failed_attempt"]
     schema_guide: EvidenceSchemaGuide
     ue: MaskedUEIdentity
@@ -91,9 +91,14 @@ class EvidencePacket(BaseModel):
 
 ## 6. Initial Versus Expanded Invariants
 
+`pass_stage` uses the shared `EvidenceStage` enum (`LLD.md` section 4.10):
+the packet built at stage `primary` is the "initial packet" consumed by the
+initial model pass; the packet built at stage `dependency_expanded` is
+consumed by the single final model pass.
+
 ### Initial packet
 
-- `pass_stage=initial`.
+- `pass_stage=primary`.
 - `parent_packet_id=None`.
 - `root_cause_revision` identifies the immutable primary T12 result.
 - `scenario_validation_revision` identifies the primary T14 result when a scenario exists.
@@ -134,8 +139,13 @@ Dependency-expanded packets treat causal/contributing inspection evidence as man
 
 ## 8. Evidence Record Model
 
+Evidence identity is owned by the evidence registry (`LLD.md` section 24).
+T15 **selects and re-serializes** existing registry records into the packet
+form below; it never mints `evidence_id` values. Every `evidence_id` in a
+packet must already resolve through T18 without the packet existing.
+
 ```python
-class EvidenceRecord(BaseModel):
+class PacketEvidenceRecord(BaseModel):
     evidence_id: UUID
     source_event_ids: list[UUID]
     frames: list[int]
@@ -148,7 +158,11 @@ class EvidenceRecord(BaseModel):
     truncated: bool
 ```
 
-`observed` uses allowlisted semantic fields. Full bodies/trees are not embedded; small exact excerpts are permitted only when essential and policy-safe.
+`PacketEvidenceRecord` is the masked, bounded packet projection of the
+canonical `EvidenceRecord`; `evidence_id`, `source_event_ids`, `frames` and
+`record_type` are copied unchanged from the registry record. `observed` uses
+allowlisted semantic fields. Full bodies/trees are not embedded; small exact
+excerpts are permitted only when essential and policy-safe.
 
 ## 9. Schema Guide
 

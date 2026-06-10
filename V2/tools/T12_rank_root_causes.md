@@ -40,7 +40,7 @@ class RankRootCausesRequest(BaseModel):
     terminal_effects: list[TerminalEffect]
     comparison: AttemptComparison | None
     dependency_results: list[DependencyInspectionResult] = Field(default_factory=list)
-    pass_stage: Literal["primary", "dependency_expanded"]
+    pass_stage: EvidenceStage
     primary_ranking_revision: str | None = None
     ranking_policy_version: str
 
@@ -48,7 +48,7 @@ class RankRootCausesRequest(BaseModel):
 class RootCauseResult(BaseModel):
     schema_version: Literal["2.0"]
     attempt_id: UUID
-    pass_stage: Literal["primary", "dependency_expanded"]
+    pass_stage: EvidenceStage
     primary_candidate_id: UUID | None
     alternative_candidate_ids: list[UUID]
     downstream_candidate_ids: list[UUID]
@@ -125,6 +125,15 @@ Relations derive from explicit references, shared scoped identifiers, profile st
 Cycles in causal relations indicate inconsistent evidence; break weakest relation and record a warning.
 
 ## 8. Score Model
+
+The score model below is canonical in `LLD.md` section 12, including the term
+table, the `ScoreTerm` definition and the mapping from the former term names
+(`detector_score`, `baseline_divergence_bonus`,
+`ambiguous_correlation_penalty`). This section elaborates how T12 applies it.
+`pass_stage` uses the shared `EvidenceStage` enum (`LLD.md` section 4.10).
+T12 consumes immutable `FailureCandidate` objects and their detector score
+terms (`LLD.md` section 4.6); it persists its conclusions in
+`RankedCandidate` and never mutates a published candidate.
 
 ```text
 rank_score = detector_base

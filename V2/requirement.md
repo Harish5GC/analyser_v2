@@ -70,6 +70,8 @@ A PDU session ID may be reused. It must never be the sole attempt identifier.
 - `api_key`: required for OpenRouter; optional for local endpoints.
 - `ue_selector`: SUPI, SUCI, GPSI, GUTI, AMF UE NGAP ID, RAN UE NGAP ID, or internal UE ID.
 - `attempt_selector`: internal attempt ID.
+- `max_model_attempts_per_run`: default `5`; caps how many failed/incomplete attempts receive model narration. Deterministic analysis always covers every attempt.
+- `model_attempt_order`: deterministic narration ordering policy; default selects by highest deterministic severity, then earliest start frame.
 - `dependency_lookup_mode`: fixed to `model_requested` in V2.1.
 - `max_dependency_requests_per_attempt`: default `2`, with at most one NRF and one UDR request.
 - `dependency_context_frames_before`: bounded default for approved dependency lookup.
@@ -138,6 +140,7 @@ The report must contain:
 - Evidence references.
 - Scenario checkpoint results when a scenario was supplied.
 - Deterministic confidence and model confidence as separate fields.
+- Attempts analyzed deterministically but skipped by the model-narration cap, with the policy values that caused the skip.
 - Missing-data and decoder warnings.
 
 ## 5. Decoder Requirements
@@ -459,7 +462,7 @@ Checks:
 - Error Indication and NAS Non Delivery Indication.
 - PDU session resource setup/modify/release failures.
 - UE context setup or release abnormalities.
-- Initiating message without an expected outcome.
+- Initiating message without an expected outcome, recorded as a request-only observation for T09. T09 is the sole owner of implicit missing-transition/missing-response candidates; T07 must not emit a duplicate candidate for the same absence.
 - Required NAS or NGAP transition missing within the attempt.
 
 The tool must distinguish a final UE-facing reject from an earlier network-side cause.

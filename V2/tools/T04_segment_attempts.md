@@ -58,6 +58,7 @@ class SegmentAttemptsResult(BaseModel):
     analysis_id: UUID
     status: Literal["success", "partial", "failed"]
     manifest: ArtifactDescriptor
+    revision: str
     attempt_count: int
     outcome_counts: dict[str, int]
     profile_counts: dict[str, int]
@@ -65,6 +66,10 @@ class SegmentAttemptsResult(BaseModel):
     unassigned_event_count: int
     warnings: list[AttemptWarning]
 ```
+
+`revision` is the section 25 (`LLD.md`) revision envelope digest for this
+attempt generation; downstream consumers (T10/T11/T21 and lineage validation)
+reference attempts by this value.
 
 ## 5. Procedure Attempt Model
 
@@ -109,6 +114,8 @@ Open attempts are internal transient objects. A completed T04 artifact must not 
 class ProcedureProfile(BaseModel):
     profile_id: str
     version: str
+    release: str
+    deployment_profile: str
     procedure_type: str
     trigger_matchers: list[EventMatcher]
     correlation_keys: list[CorrelationKeyRule]
@@ -123,6 +130,13 @@ class ProcedureProfile(BaseModel):
 ```
 
 Every stage declares `mandatory`, `conditional`, `optional`, or `repeatable`. Conditional stages include a machine-evaluable applicability predicate.
+
+This model is the profile *schema* only. The normative registry contract —
+file format, authoring/review process, release/deployment overlays,
+conditional grammar, versioning/checksums and the traceability mapping from
+every `requirement.md` section-8 flow to profile IDs and fixtures — is
+`profiles/README.md`. T04 loads profiles exclusively through that registry via
+the configuration resolver (`LLD.md` section 29).
 
 ## 7. Supported Profile Families
 

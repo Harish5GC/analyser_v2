@@ -24,8 +24,9 @@ T06 receives:
 
 - One `ProcedureAttempt`.
 - Attempt-assigned HTTP2 events from `PrimaryEventReader`.
-- T21 capture-phase intervals.
-- Versioned SBI operation policy.
+- The shared attempt-scoped `DetectionContext` (`LLD.md` section 11), which
+  carries capture bounds, the T21 phase reader, interface visibility,
+  assignment confidence and the resolved SBI operation policy handle.
 
 It returns candidates, retry groups, and dependency suspicions. It cannot construct `NRFEventReader` or `UDREventReader`.
 
@@ -37,8 +38,7 @@ class FindHTTPFailuresRequest(BaseModel):
     analysis_id: UUID
     attempt: ProcedureAttempt
     event_ids: list[UUID]
-    capture_phases: CapturePhaseReader
-    operation_policy_version: str
+    context: DetectionContext
 
 
 class FindHTTPFailuresResult(BaseModel):
@@ -77,6 +77,14 @@ class HTTPFailureObserved(BaseModel):
 
 Every candidate records detector rule ID/version, explicitness, score inputs, phase, relevance, source event/evidence IDs, and any downstream/cleanup flag.
 
+Per the `FailureCandidate` ownership table (`LLD.md` section 4.6): T06 assigns
+`severity` from its versioned rule table, resolves `capture_phase` through
+`context.phase_reader`, sets `relevance` per section 14, persists every score
+term, and always publishes `call_impact="inconclusive"` — only T23 produces
+other impact values. Published candidates are immutable. Evidence cited by a
+candidate is minted through the evidence registry (`LLD.md` section 24) at
+detection time.
+
 ## 6. SBI Operation Policy
 
 Expected behavior is table-driven:
@@ -97,6 +105,10 @@ class HTTPOperationPolicy(BaseModel):
 ```
 
 Unknown operations use generic HTTP semantics and lower confidence. Vendor-specific policies are separately versioned.
+
+The operation-policy table arrives as a resolved, checksummed handle in
+`context.policies` (configuration resolver, `LLD.md` section 29); T06 never
+loads policy files from a bare version string.
 
 ## 7. HTTP Status Detection
 
