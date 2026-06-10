@@ -29,7 +29,7 @@ Inputs:
 - Attempt-assigned NAS and NGAP events from `PrimaryEventReader`.
 - The applicable procedure profile.
 - The shared attempt-scoped `DetectionContext` (`LLD.md` section 11), carrying
-  capture bounds, the T21 phase reader, interface visibility, assignment
+  capture bounds, the T21 phase reader, reference-point/SBI visibility, assignment
   confidence and the resolved NAS/NGAP cause-dictionary handles.
 
 The detector may read exact full evidence through T18 for fields already referenced by assigned events, but cannot perform broad context lookup or re-decode.
@@ -361,7 +361,7 @@ T07 is complete when:
 2. Item-level NGAP failures are scoped to the correct PDU session/resource.
 3. Terminal UE effects are explicitly tagged for T12.
 4. Upstream-versus-downstream metadata is preserved without premature ranking.
-5. Encryption and interface visibility prevent false conclusions.
+5. Encryption and reference-point/SBI visibility prevent false conclusions.
 6. Mobility preparation, execution, path switch, and rollback are distinguished.
 7. Cause dictionaries are versioned and unknown values remain usable.
 8. Primary-only access is enforced.

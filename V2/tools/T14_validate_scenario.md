@@ -13,7 +13,8 @@ T14 must not:
 - Parse free text; T13 owns parsing.
 - Diagnose root cause beyond scenario checkpoint status.
 - Use model narrative as evidence.
-- Treat absent evidence as failure when the interface/capture is insufficient.
+- Treat absent evidence as failure when reference-point/SBI visibility or
+  capture bounds are insufficient.
 - Read hidden NRF/UDR partitions directly.
 - Expand a scenario with unstated expectations.
 
@@ -100,10 +101,14 @@ class CheckpointResult(BaseModel):
     frames: list[int]
     reason_codes: list[str]
     visibility: str
+    visibility_results: list[StageVisibilityResult] = Field(default_factory=list)
     conflict: bool = False
 ```
 
-Every failed or verified result must cite exact evidence. Inconclusive results cite missing visibility/data reasons and available boundary evidence.
+`visibility_results` uses the T09 `StageVisibilityResult` shape when a
+checkpoint depends on profile stage visibility. Every failed or verified
+result must cite exact evidence. Inconclusive results cite missing
+visibility/data reasons and available boundary evidence.
 
 ## 8. Status Semantics
 

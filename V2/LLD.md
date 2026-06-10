@@ -50,6 +50,7 @@ V2/
       tool_requests.py
       scenario.py
       reports.py
+      run_store.py
     decoder/
       runner.py
       manifest.py
@@ -216,6 +217,15 @@ narration. `--max-model-attempts` and `--model-attempt-order` configure the
 model narration policy defined in section 28; they never reduce deterministic
 analysis, which always covers every persisted attempt.
 
+`--include-nrf-success` and `--include-udr-success` affect report and
+dependency-expanded packet summaries only after a model-approved dependency
+inspection has run. They do not trigger dependency inspection, grant primary
+partition access, or put NRF/UDR success records in the initial packet.
+`--unmasked-local-evidence` is valid only for `provider="local"` and only
+when the resolved masking policy explicitly allows it. Reports, manifests,
+provider ledgers and remote-provider packets remain masked regardless of this
+flag.
+
 Exit codes:
 
 - `0`: analysis completed, regardless of whether the call itself failed.
@@ -237,6 +247,7 @@ class HarnessConfig(BaseModel):
     base_url: str | None = None
     model: str | None = None
     api_key_env: str | None = None
+    secret_ref: str | None = None
     model_timeout_seconds: int = 120
     temperature: float = 0.1
     max_model_input_tokens: int = 12000
@@ -256,6 +267,9 @@ class HarnessConfig(BaseModel):
     mask_remote_evidence: bool = True
     attempt_idle_timeout_seconds: float = 30.0
     retention_days: int | None = None
+    include_nrf_success: bool = False
+    include_udr_success: bool = False
+    unmasked_local_evidence: bool = False
     context_frames_before: int = 20
     context_frames_after: int = 20
     max_context_frames: int = 500
@@ -264,7 +278,13 @@ class HarnessConfig(BaseModel):
     model_attempt_order: Literal[
         "severity_then_first_frame", "first_frame", "last_frame"
     ] = "severity_then_first_frame"
+    enabled_capabilities: set[CapabilityName] = Field(default_factory=set)
 ```
+
+`api_key_env` names an environment variable resolved only inside the provider
+process boundary. `secret_ref` is an opaque secret-manager reference. Raw API
+key values are invalid in persisted configuration, manifests, provider
+ledgers and reports.
 
 Precedence:
 
@@ -277,7 +297,55 @@ Validation rules:
 - `openrouter` requires model and populated API-key environment variable.
 - `local` requires base URL and model.
 - `none` ignores model settings.
-- Remote evidence masking cannot be disabled for OpenRouter in V2.1.
+- Remote evidence masking cannot be disabled for OpenRouter.
+- `unmasked_local_evidence=true` is rejected unless `provider="local"` and
+  the resolved `MaskingPolicy.local_unmasked_allowed` is true.
+- `include_nrf_success` and `include_udr_success` never imply dependency
+  inspection; they are disclosure controls for approved dependency results.
+
+### 3.1 Version vocabulary and capability gates
+
+Version terms have distinct runtime meanings:
+
+```python
+CapabilityName = Literal[
+    "cli_single_run",
+    "jsonl_run_store",
+    "profile_registry",
+    "canonical_artifact_revisions",
+    "two_pass_dependency_inspection",
+    "bounded_targeted_redecode",
+    "authenticated_evidence_cursors",
+    "openai_compatible_provider",
+    "masking_policy",
+    "api_service",
+    "sqlite_event_store",
+    "queued_analysis",
+    "additional_dependency_tools",
+    "vendor_specific_profiles",
+    "learned_anomaly_ranking",
+]
+
+class VersionVocabulary(BaseModel):
+    product_generation: Literal["V2"]
+    release_milestone: str
+    document_revision: str
+    schema_versions: dict[str, str]
+    policy_versions: dict[str, str]
+    artifact_revisions: dict[str, str]
+    enabled_capabilities: set[CapabilityName]
+```
+
+`product_generation` names this harness generation. `release_milestone` is
+roadmap metadata and must not control behavior. `document_revision` identifies
+these Markdown contracts. `schema_versions` identify persisted payload
+compatibility. `policy_versions` identify checksummed config/profile/policy
+inputs. `artifact_revisions` identify immutable tool output generations.
+
+Runtime behavior is selected by `enabled_capabilities` and validated resolved
+configuration, never by matching prose such as a milestone number. Enabling a
+new capability requires an owner, config schema, manifest disclosure, issue
+codes where applicable and tests before tools may branch on it.
 
 ## 4. Core Data Models
 
@@ -308,6 +376,9 @@ class CanonicalEvent(BaseModel):
     protocol: Literal["NAS", "NGAP", "HTTP2", "PFCP"]
     frame: int
     timestamp: Decimal | None
+    timestamp_precision: Literal[
+        "seconds", "milliseconds", "microseconds", "nanoseconds", "unknown"
+    ] = "unknown"
     src: str | None
     dst: str | None
     direction: Literal["UE_TO_NETWORK", "NETWORK_TO_UE", "NF_TO_NF", "UNKNOWN"]
@@ -316,9 +387,16 @@ class CanonicalEvent(BaseModel):
     identifiers: EventIdentifiers
     attributes: dict[str, JsonValue]
     raw_refs: list[SourceRef]
+    partition: Literal["primary", "nrf", "udr"]
+    validation_status: Literal["valid", "partial", "quarantined"]
+    issues: list[Issue] = Field(default_factory=list)
 ```
 
-`timestamp` is normalized to seconds from capture epoch when available. Frame order is the deterministic fallback.
+JSONL is the physical persistence format; `CanonicalEvent` is the logical
+schema. `timestamp` is normalized to absolute Unix-epoch decimal seconds when
+available and records source precision. Frame order is the deterministic
+fallback. `raw_refs` is plural for every logical event, including events whose
+primary source is one decoded record.
 
 ### 4.3 Event identifiers
 
@@ -387,10 +465,40 @@ tests.
 ### 4.5 Procedure attempt
 
 ```python
+class ProfileSelectionAlternative(BaseModel):
+    profile_id: str
+    procedure: ProcedureType
+    confidence: Decimal
+    score_terms: list[ScoreTerm]
+    status: Literal["selected", "alternative", "rejected", "disambiguated"]
+    evidence_ids: list[UUID]
+    rationale_codes: list[str]
+    rejection_reason: str | None = None
+
+class StageTimingObservation(BaseModel):
+    stage_id: str
+    status: Literal["observed", "absent", "not_applicable", "inconclusive"]
+    anchor: Literal[
+        "event_frame", "timeout_deadline", "capture_boundary",
+        "profile_condition", "derived_interval"
+    ]
+    start_frame: int | None
+    end_frame: int | None
+    start_time: Decimal | None
+    end_time: Decimal | None
+    precision: Literal["frame_exact", "time_exact", "frame_range", "time_range", "unknown"]
+    source: Literal[
+        "T04", "T05", "T06", "T07", "T08", "T09", "T21", "T22", "T23"
+    ]
+    evidence_ids: list[UUID]
+    reason_codes: list[str]
+
 class ProcedureAttempt(BaseModel):
     attempt_id: UUID
     ue_id: UUID
     procedure: ProcedureType
+    profile_id: str
+    profile_alternatives: list[ProfileSelectionAlternative] = Field(default_factory=list)
     sequence: int
     parent_attempt_id: UUID | None
     start_frame: int
@@ -403,6 +511,7 @@ class ProcedureAttempt(BaseModel):
     transitions: list[StateTransition]
     event_ids: list[UUID]
     retries: list[RetryRecord]
+    stage_timings: list[StageTimingObservation] = Field(default_factory=list)
     outcome: Literal["open", "succeeded", "failed", "aborted", "timed_out", "incomplete_capture"]
     completion_reason: str | None
 ```
@@ -474,12 +583,6 @@ class NFLifecycleEvent(BaseModel):
     classification: Literal["normal", "benign_startup_cleanup", "failure", "recovery", "unknown"]
     evidence_ids: list[UUID]
 
-class NFReadinessSnapshot(BaseModel):
-    attempt_id: UUID
-    frame: int
-    instances: list[NFInstanceReadiness]
-    unresolved_failures: list[UUID]
-
 class BackgroundImpact(BaseModel):
     candidate_id: UUID
     attempt_id: UUID
@@ -488,6 +591,10 @@ class BackgroundImpact(BaseModel):
     rationale_codes: list[str]
     evidence_ids: list[UUID]
 ```
+
+`NFReadinessSnapshot` is the service-requirement snapshot defined in section
+23.4. Lifecycle events feed readiness, but readiness is never collapsed into
+one global NF-instance state.
 
 ### 4.9 UE request
 
@@ -591,19 +698,29 @@ The full HTTP/2 record remains unchanged in `decoded/full/` and is reachable thr
 
 NAS extraction recursively searches known Wireshark paths but maps results to stable names.
 
-Required message maps include:
+NAS message, IE, cause and release-compatibility mappings come from one
+resolved protocol codepoint registry. LLD and tool specs must not duplicate
+NAS codepoint tables; they reference registry names and semantic fields.
 
-- `0x41`: Registration Request.
-- `0x42`: Registration Accept.
-- `0x44`: Registration Reject.
-- `0x4c`: Service Request where applicable to decoder naming.
-- `0x4d`: Service Reject.
-- `0xc1`: PDU Session Establishment Request.
-- `0xc2`: PDU Session Establishment Accept.
-- `0xc3`: PDU Session Establishment Reject.
-- PDU session modification and release message types.
+```python
+class ProtocolCodepointRegistry(BaseModel):
+    registry_name: Literal["5g_nas_ngap_pfcp"]
+    registry_version: str
+    schema_version: str
+    sha256: str
+    nas_message_types: dict[str, str]
+    nas_causes: dict[str, str]
+    ngap_procedures: dict[str, str]
+    ngap_causes: dict[str, str]
+    pfcp_message_types: dict[str, str]
+    pfcp_causes: dict[str, str]
+```
 
-Mappings must be table-driven and tested against fixture trees. Unknown message codes remain events with `message_type = "NAS_UNKNOWN_<code>"`.
+The section 29 resolver validates this registry at startup and passes an
+immutable handle to T02. Unknown NAS message codes remain events with
+`message_type = "NAS_UNKNOWN_<code>"` and preserve the raw code in
+`attributes`. Registry changes enter the T02 revision through
+`policy_versions`.
 
 ### 6.3 NGAP normalization
 
@@ -612,6 +729,15 @@ NGAP normalizer emits the NGAP procedure event and invokes the NAS normalizer fo
 ### 6.4 PFCP normalization
 
 PFCP requests and responses are initially linked by `response_to`, then by sequence number, endpoints and time when `response_to` is absent.
+
+### 6.5 Partition routing
+
+Partition routing is versioned, table-driven and conservative. NAS, NGAP and
+PFCP events always route to the `primary` partition in V2. HTTP/2/SBI events
+route through the resolved primary/NRF/UDR partition policy using normalized
+service/API/resource/producer/consumer metadata, never only host substrings.
+T02 records the partition policy version and partition reason on each event
+and in the normalization manifest.
 
 ## 7. Storage Interfaces
 
@@ -654,32 +780,63 @@ class EvidenceRepository(Protocol):
     def targeted_redecode(self, query: RedecodeQuery) -> DerivedArtifact: ...
 ```
 
-Artifact layout:
+Canonical artifact layout:
 
 ```text
-source/capture.pcap
-decoded/raw/<protocol>.packets.jsonl
-decoded/full/http2/streams/<stream-document-uuid>.json
-decoded/full/http2/stream_index.jsonl
-decoded/full/ngap/messages.jsonl
-decoded/full/ngap/message_index.jsonl
-decoded/full/pfcp/messages.jsonl
-decoded/full/pfcp/message_index.jsonl
-decoded/decoder_manifest.json
-normalized/events.jsonl
-normalized/primary_events.jsonl
-normalized/nrf_events.jsonl
-normalized/udr_events.jsonl
-indexes/frame_index.json
-indexes/stream_index.json
-indexes/nrf_index.json
-indexes/udr_index.json
-indexes/artifact_index.json
-evidence/context/<query-id>.jsonl
-evidence/redecode/<query-id>.jsonl
+source/
+  capture.pcap
+  source_manifest.json
+decoder/
+  raw/<protocol>.packets.jsonl
+  full/http2/streams/<stream-document-uuid>.json
+  full/http2/stream_index.jsonl
+  full/ngap/messages.jsonl
+  full/ngap/message_index.jsonl
+  full/pfcp/messages.jsonl
+  full/pfcp/message_index.jsonl
+  decoder_manifest.json
+normalized/
+  events/events.jsonl
+  events/primary_events.jsonl
+  events/nrf_events.jsonl
+  events/udr_events.jsonl
+  identity/
+  attempts/
+  diagnostics/
+  phases/
+  scenario/
+evidence/
+  registry/
+  packets/
+  context/<query-id>/
+  targeted_redecode/<query-id>/
+  dependency/<request-id>/
+model/
+  calls/
+  ledgers/
+reports/
+  report.json
+  report.md
+  report_manifest.json
+indexes/
+  frame_index.json
+  stream_index.json
+  nrf_index.json
+  udr_index.json
+  identifier_index.json
+  attempt_index.json
+  evidence_index.json
+  artifact_index.json
+staging/
+manifest.json
 ```
 
-Each artifact index entry contains path, checksum, size, record count, format, creation stage and parent source checksum.
+Every published file or directory collection has an `ArtifactDescriptor` or
+`CollectionDescriptor` (section 23.2). Writers publish through `staging/`,
+fsync, validate descriptors and promote with atomic rename. `manifest.json` is
+published last. T19 context queries and T20 targeted re-decodes are immutable
+query-owned directories containing request, result, child index and manifest
+artifacts; they are not single loose JSONL files.
 
 ### 7.2 Context lookup algorithm
 
@@ -895,13 +1052,60 @@ One high-level procedure may have multiple `profile_id` values for release, acce
 ### 10.3 Visibility model
 
 ```python
+VisibilityDomain = Literal["reference_point", "sbi_service", "sbi_api"]
+VisibilityState = Literal["visible", "partial", "not_captured", "unknown"]
+
+class ReferencePointVisibility(BaseModel):
+    key: str
+    endpoint_roles: tuple[str, str]
+    supported_releases: list[str]
+    supported_deployment_profiles: list[str]
+    realized_by_sbi_services: list[str] = Field(default_factory=list)
+
+class SBIServiceVisibility(BaseModel):
+    service_name: str
+    producer_nf: str
+    supported_releases: list[str]
+    supported_deployment_profiles: list[str]
+    api_names: list[str] = Field(default_factory=list)
+
+class SBIAPIVisibility(BaseModel):
+    api_name: str
+    service_name: str
+    supported_releases: list[str]
+    supported_deployment_profiles: list[str]
+
+class VisibilityRegistry(BaseModel):
+    reference_points: dict[str, ReferencePointVisibility]
+    sbi_services: dict[str, SBIServiceVisibility]
+    sbi_apis: dict[str, SBIAPIVisibility]
+
 class VisibilityRequirement(BaseModel):
-    interface: Literal["N1", "N2", "N4", "N8", "N10", "N11", "N12", "N15", "N16", "N22", "N27", "N40", "Nnrf", "N9", "Xn"]
+    domain: VisibilityDomain
+    key: str
     evidence_matchers: list[EventMatcher]
     required_for_missing_stage_failure: bool
+    minimum_state: Literal["visible", "partial"] = "visible"
 ```
 
-The engine derives `observed`, `not_observed` or `unknown` per interface. A missing mandatory stage becomes `inconclusive` unless its interface is observed or the scenario/capture metadata explicitly guarantees visibility.
+Visibility is resolved from the selected release/deployment profile, not from a
+timeless enum. `reference_point` keys name point-to-point architecture
+reference points, while `sbi_service` and `sbi_api` keys name service-based
+interfaces and concrete APIs from normalized HTTP/SBI metadata. The namespaces
+are disjoint: `Nnrf` is valid SBI service visibility, not a reference-point
+key; NRF-to-NRF roaming visibility is represented by `N27`.
+
+The release/profile registry must include the reference points needed by the
+supported procedure families, including `N7` (SMF-PCF policy), `N13`
+(UDM-AUSF authentication), `N35` (UDM-UDR), `N36` (PCF-UDR), and `N37`
+(NEF-UDR). Existing keys such as `N1`, `N2`, `N4`, `N8`, `N9`, `N10`, `N11`,
+`N12`, `N15`, `N16`, `N22`, `N27`, `N40`, and `Xn` remain registry entries
+when applicable to the selected release/deployment profile.
+
+The engine derives `visible`, `partial`, `not_captured`, or `unknown` per
+domain/key. A missing mandatory stage becomes `inconclusive` unless every
+required visibility entry for that stage reaches its `minimum_state`, or the
+scenario/capture metadata explicitly guarantees equivalent visibility.
 
 ### 10.4 Profile selection
 
@@ -914,7 +1118,13 @@ Profile scoring uses:
 5. Emergency indication or emergency DNN.
 6. Scenario constraints.
 
-Observed protocol evidence has precedence over scenario wording. Profiles within `0.10` of the highest score remain alternatives until later stages disambiguate them.
+Observed protocol evidence has precedence over scenario wording. Profiles
+within `0.10` of the highest score remain alternatives until later stages
+disambiguate them. T04 persists every selected, alternative, rejected and later
+disambiguated profile in `ProcedureAttempt.profile_alternatives`, including
+score terms, confidence, evidence and rationale codes. T17 renders these as
+procedure-profile alternatives; they are not root-cause alternatives and must
+not be mixed into T12 candidate ranking.
 
 ### 10.5 Registration profiles
 
@@ -996,7 +1206,42 @@ Home-routed profiles expect V-SMF/H-SMF and home/visited path stages only when v
 
 Mobility attempts use identifier validity intervals. When AMF/RAN IDs change, the old and new identities are linked through context-transfer events, handover messages, PDU session IDs, security context and time proximity. An identifier reused after its validity interval must not link unrelated UEs.
 
-PFCP tunnel changes during handover are expected. The consistency detector compares the target NGAP tunnel with resulting PFCP FAR/PDR updates rather than comparing against source tunnel values.
+PFCP tunnel changes during handover are expected. The consistency detector
+compares the target NGAP tunnel with resulting PFCP FAR/PDR updates rather
+than comparing against source tunnel values. Directional F-TEID checks are
+profile/stage-aware: NGAP downlink transport parameters are compared to PFCP
+FAR Outer Header Creation for the downlink path, while PFCP-created uplink PDR
+F-TEID values are compared to the NGAP/session expectation for uplink user
+plane. During path switch, target-path checks activate only after the profile's
+target-activation stage; source and target tunnels may legally coexist until
+old-path cleanup. N9/inter-UPF variants use profile-declared intermediate
+tunnel roles instead of one static direction rule.
+
+### 10.10 Reachability and mobile-terminated delivery profiles
+
+Reachability-loss and mobile-terminated delivery analysis is profile-driven,
+not inferred from one missing packet. The profile families are:
+
+- `PAGING`: network paging trigger, paging attempt window, UE response or
+  timeout.
+- `NETWORK_TRIGGERED_SERVICE`: network downlink trigger, paging when idle,
+  service request, access-resource activation and user-plane delivery.
+- `UE_SERVICE_REQUEST`: UE-triggered service restoration, access-resource
+  activation and bearer/tunnel readiness.
+
+T04 selects the profile and attempt bounds. T06 owns primary SBI symptoms such
+as failed or unanswered N1N2 message transfer and other core-triggered
+delivery requests. T07 owns explicit NAS/NGAP paging, service-request,
+resource setup, non-delivery and reject observations. T08 owns PFCP Session
+Report, downlink-data, user-plane path failure and directional tunnel
+activation observations. T09 owns absent-stage conclusions only after the
+profile timeout and visibility checks say the missing stage was observable.
+
+A missing paging response, service request or user-plane delivery stage is
+`inconclusive` when capture bounds, radio/core visibility, identity linkage or
+idle/reachable state are insufficient. Downlink Data and other routine PFCP
+reports remain observations unless the profile and policy map them to the
+failed delivery stage.
 
 ## 11. Detector Interfaces
 
@@ -1020,7 +1265,8 @@ class DetectionContext(BaseModel):
   `request_only_capture_boundary`) have a defined input.
 - `phase_reader` resolves any frame to its T21 interval so every candidate can
   populate `capture_phase` deterministically.
-- `visibility` is the attempt's persisted T04 interface visibility.
+- `visibility` is the attempt's persisted T04 reference-point and SBI
+  visibility.
 - `policies` contains the immutable handles produced by the configuration
   resolver (section 29) for operation policies, cause dictionaries and timeout
   tables; detectors never receive bare version strings.
@@ -1058,10 +1304,103 @@ class FailureDetector(Protocol):
 ### 11.3 PFCP scoring
 
 - Non-accepted response cause: base `0.95`.
+- PFCP Association Setup/Update/Release rejection or unrecovered timeout for
+  a node pair selected by the attempt: base `0.90`.
 - Request timeout: base `0.80`.
+- Session Report Error Indication or user-plane path failure mapped to the
+  attempt SEID/F-TEID: base `0.85`.
 - Session/SEID inconsistency: base `0.75`.
+- Directional F-TEID role mismatch: base `0.75-0.90` by explicitness and
+  profile stage.
 
 Scores rank candidates but do not represent statistical probability.
+
+### 11.4 PFCP node, report and tunnel-role contracts
+
+T08 owns these observations. Association and routine report observations are
+persisted even when they do not become failure candidates:
+
+```python
+class PFCPAssociationObservation(BaseModel):
+    observation_id: UUID
+    node_pair_id: UUID
+    local_node: str | None
+    remote_node: str | None
+    message_family: Literal[
+        "association_setup", "association_update", "association_release",
+        "heartbeat"
+    ]
+    outcome: Literal[
+        "accepted", "rejected", "timed_out", "released",
+        "restart_detected", "recovered", "unknown"
+    ]
+    availability: Literal["available", "unavailable", "degraded", "unknown"]
+    recovery_timestamp_before: str | None
+    recovery_timestamp_after: str | None
+    attempt_link: Literal[
+        "selected_node_pair", "used_session", "supporting_only",
+        "unrelated", "unknown"
+    ]
+    evidence_ids: list[UUID]
+
+class PFCPSessionReportObservation(BaseModel):
+    report_id: UUID
+    report_type: Literal[
+        "error_indication", "user_plane_path_failure", "downlink_data",
+        "usage", "session_report", "unknown"
+    ]
+    seid: str | None
+    f_teids: list[str]
+    mapped_attempt_id: UUID | None
+    relevance: Literal[
+        "attempt_failure_evidence", "observation", "unrelated",
+        "inconclusive"
+    ]
+    evidence_ids: list[UUID]
+
+class TunnelRoleExpectation(BaseModel):
+    role: Literal[
+        "ngap_downlink_transport", "pfcp_far_outer_header_creation",
+        "pfcp_uplink_pdr_f_teid", "n9_intermediate_tunnel",
+        "source_path", "target_path", "cleanup_path"
+    ]
+    stage_id: str
+    activation: Literal["source_active", "target_prepared", "target_active", "cleanup"]
+    address: str | None
+    teid: str | None
+    qfi: str | None
+    evidence_ids: list[UUID]
+
+class PFCPConsistencyResult(BaseModel):
+    check_id: UUID
+    check_type: str
+    expected: list[TunnelRoleExpectation]
+    observed: list[TunnelRoleExpectation]
+    status: Literal["consistent", "inconsistent", "inconclusive", "not_applicable"]
+    evidence_ids: list[UUID]
+    rationale: str
+```
+
+Association observations derive attempt candidates only when the attempt
+selected or used that node pair and the observation is causally reachable for
+the failed stage. T08 must never publish one node-level candidate shared
+directly by multiple attempts. Session Report Error Indication and user-plane
+path failure can be candidate evidence only when SEID/F-TEID/session mapping
+links them to the attempt; Downlink Data, Usage and other reports remain
+observations unless profile/cause policy explicitly promotes them.
+
+Tunnel-role expectations are the only T08 input for F-TEID consistency checks.
+T08 compares role-to-role expectations (`ngap_downlink_transport` to
+`pfcp_far_outer_header_creation`, uplink expectation to
+`pfcp_uplink_pdr_f_teid`, and profile-declared N9/source/target/cleanup roles)
+rather than globally matching every TEID/address it can see.
+
+PFCP transaction/report `unknown` is an observation state for incomplete,
+unsupported or unclassified PFCP evidence. Diagnostic confidence is separate:
+partial visibility, an unknown transaction outcome, missing context or
+conflicting role evidence may make a candidate or consistency result
+`inconclusive`, but `inconclusive` is not added to PFCP transaction-outcome
+enums.
 
 ## 12. Root-Cause Ranking Algorithm
 
@@ -1148,7 +1487,7 @@ Eligibility (all required):
 3. `outcome=succeeded`.
 4. Earlier than the failed attempt (future-success baselines are a deferred
    `population_baselines` capability, not a V2 behavior).
-5. Sufficient interface visibility for the compared stages.
+5. Sufficient reference-point/SBI visibility for the compared stages.
 
 Ordering (strict priority):
 
@@ -1179,6 +1518,71 @@ class AttemptComparison(BaseModel):
 ```
 
 Dynamic fields excluded from comparison include frame, timestamp, sequence, stream ID, SEID, TEID, UUID and invocation timestamp unless a detector explicitly requires them.
+
+### 13.1 Attempt timeline contract
+
+T10 owns timeline construction. It provides evidence-linked chronological
+views for reports, model packets and bounded investigation, but it does not
+diagnose, rerank or mutate candidates.
+
+```python
+TimelineMode = Literal["internal", "model", "report", "dependency_expanded"]
+TimelineLabel = Literal[
+    "expected",
+    "anomalous",
+    "failure",
+    "retry",
+    "cleanup",
+    "terminal",
+    "missing_transition",
+    "dependency_evidence",
+]
+
+class TimelineItem(BaseModel):
+    item_id: UUID
+    attempt_id: UUID
+    child_attempt_id: UUID | None = None
+    event_id: UUID | None = None
+    candidate_id: UUID | None = None
+    checkpoint_id: UUID | None = None
+    frame: int
+    timestamp: Decimal | None
+    sort_ordinal: int
+    protocol: str
+    direction: str
+    stage_id: str | None = None
+    message: str
+    label: TimelineLabel
+    outcome: str | None = None
+    identifiers: dict[str, str]
+    evidence_ids: list[UUID]
+    full_record_available: bool
+    summary_attributes: dict[str, JsonValue]
+
+class AttemptTimelineResult(BaseModel):
+    schema_version: Literal["2.0"]
+    attempt_id: UUID
+    mode: TimelineMode
+    items: list[TimelineItem]
+    total_matching: int
+    returned: int
+    truncated: bool
+    next_cursor: str | None
+    revision: str
+    issues: list[Issue] = Field(default_factory=list)
+```
+
+Mode limits are hard maxima: `model` returns at most 20 items, `internal` 50,
+`report` 100 and `dependency_expanded` 50 unless resolved configuration lowers
+the value. Configuration cannot raise the `model` cap above 20. Labels are
+closed for a schema/policy revision; adding a label requires a schema update,
+renderer support and golden report coverage.
+
+Timeline items cite event, candidate, checkpoint and evidence IDs. Synthetic
+missing-transition items use profile deadline/anchor frames and cite the
+candidate/stage evidence; they never fabricate a packet frame. T10 may expose
+checkpoint or candidate evidence for downstream explanation, but diagnostic
+conclusions remain owned by T12/T14/T17.
 
 ## 14. Scenario Models
 
@@ -1233,6 +1637,26 @@ Token budgeting order:
 5. Baseline details are reduced to first divergence.
 6. Bodies are shortened before any mandatory evidence is removed.
 
+Mandatory evidence is a named construction invariant:
+
+```python
+class MandatoryEvidenceSet(BaseModel):
+    ue_request_evidence_ids: list[UUID]
+    attempt_identity_evidence_ids: list[UUID]
+    primary_candidate_evidence_ids: list[UUID]
+    terminal_effect_evidence_ids: list[UUID]
+    required_checkpoint_evidence_ids: list[UUID]
+    first_divergence_evidence_ids: list[UUID]
+    dependency_causal_evidence_ids: list[UUID] = Field(default_factory=list)
+```
+
+T15 may shorten nonessential bodies, repeated successful timeline items,
+verbose alternatives and low-priority context during normal trimming. It must
+not remove any record referenced by `MandatoryEvidenceSet`. If the mandatory
+set plus schema guide cannot fit the resolved pass budget, packet
+construction fails deterministically before T16 is invoked; T15 must not
+silently degrade by dropping mandatory evidence.
+
 The packet built at `pass_stage="primary"` is the initial packet (section
 4.10). It cannot contain detailed NRF or UDR events and sets
 `parent_packet_id=None` with no dependency revisions. A dependency-expanded
@@ -1261,6 +1685,31 @@ class DependencyInspector(Protocol):
 
 ## 16. Model Provider Interface
 
+Provider client abstractions live in `harness/providers/` and are shared by
+scenario parsing (T13) and diagnosis generation (T16). T16 owns diagnosis
+ledgering, pass validation and dependency-request validation; it does not own
+the provider package. T14 is deterministic and never invokes a provider.
+
+```python
+class ProviderConfig(BaseModel):
+    provider: Literal["none", "local", "openrouter"]
+    base_url: str | None
+    model: str | None
+    api_key_env: str | None = None
+    secret_ref: str | None = None
+    timeout_seconds: int
+    structured_output: Literal["require", "prefer", "disabled"] = "require"
+    runtime_revision: str
+
+class ProviderMetadata(BaseModel):
+    provider: Literal["none", "local", "openrouter"]
+    model: str | None
+    base_url_origin: str | None
+    runtime_revision: str
+    request_id: str | None = None
+    token_usage: dict[str, int] = Field(default_factory=dict)
+```
+
 ```python
 class ModelProvider(Protocol):
     def generate_json(
@@ -1276,10 +1725,15 @@ class ModelProvider(Protocol):
 ```python
 OpenAI(
     base_url=config.base_url,
-    api_key=config.api_key or "local-no-key",
+    api_key=secret_resolver.resolve(config.api_key_env, config.secret_ref),
     timeout=config.model_timeout_seconds,
 )
 ```
+
+For `provider="local"`, missing credentials resolve to the literal
+`"local-no-key"` only inside the provider adapter and are never persisted as a
+secret. For remote providers, an unresolved credential reference is a startup
+configuration failure (`exit 2`).
 
 The gateway uses the persisted per-pass call ledger defined by T16 section
 12.1. Every actual provider invocation consumes the shared total cap. One
@@ -1379,20 +1833,54 @@ Validation rules:
 Top-level `report.json`:
 
 ```python
+class PipelineDecoderReport(BaseModel):
+    status: Literal["success", "partial", "failed", "absent"]
+    manifest_revision: str | None
+    protocol_statuses: dict[str, str]
+    artifacts: list[ArtifactDescriptor]
+    issues: list[Issue] = Field(default_factory=list)
+
+class PipelineReport(BaseModel):
+    decoder: PipelineDecoderReport
+    normalization_revision: str | None
+    identity_revision: str | None
+    attempts_revision: str | None
+    diagnostics_revisions: dict[str, str]
+    scenario_revision: str | None
+    provider_runtime_revision: str | None
+
+class ReportTiming(BaseModel):
+    stage_key: str
+    elapsed_ms: int
+    started_at: str | None
+    completed_at: str | None
+
 class AnalysisReport(BaseModel):
     schema_version: Literal["2.0"]
     analysis_id: UUID
     status: Literal["success", "partial", "failed"]
     capture: CaptureMetadata
-    decoder: DecoderManifest
+    pipeline: PipelineReport
     ue_results: list[UEResult]
     scenario: ScenarioResult | None
     provider: ProviderMetadata | None
-    warnings: list[str]
-    timings: dict[str, float]
+    warnings: list[Issue]
+    timings: list[ReportTiming]
+    evidence_integrity: EvidenceIntegrityReport
 ```
 
-`UEResult` contains all attempts. Each failed attempt contains deterministic root cause, model diagnosis when available, timeline and evidence.
+`UEResult` contains all attempts. Each failed attempt contains deterministic
+root cause, model diagnosis when available, timeline, profile alternatives,
+observability timing rows and evidence. T17 maps tool-local statuses into the
+top-level run status: critical publication/source/decode/report failures can
+make the run `failed`; absent protocols, partial decode, provider/scenario
+failures, unknown phase and evidence limitations make the run `partial`; UE
+call failure alone does not.
+
+Golden report normalization is versioned. It masks or normalizes volatile
+fields including UUIDs, generated timestamps, run-relative paths, durations,
+provider request IDs, token usage and revision digests while preserving
+ordering, status, evidence references and deterministic conclusions.
 
 ## 19. Orchestration Contract
 
@@ -1770,10 +2258,27 @@ Metrics:
 ### 21.1 Unit tests
 
 - NAS extraction for registration, service request, PDU establishment and rejects.
+- Protocol registry resolution: NAS message/cause mappings come from the
+  single resolved codepoint registry, and NAS/NGAP/PFCP events route to the
+  primary partition.
 - HTTP `ProblemDetails`, missing response and retry detection.
 - PFCP cause and request/response pairing.
+- PFCP association observation indexing, node-pair availability, restart
+  recovery timestamp discontinuity and attempt candidate derivation only
+  through selected/used node pairs.
+- PFCP Session Report handling: Error Indication/user-plane path failure maps
+  to an attempt by SEID/F-TEID, while downlink-data/usage reports remain
+  observations unless profile/cause policy promotes them.
+- PFCP `unknown` transaction/report outcome remains an observation state and
+  maps to diagnostic `inconclusive` only through detector confidence rules;
+  no `inconclusive` transaction outcome is accepted.
+- Directional F-TEID role checks for NGAP downlink transport, PFCP FAR Outer
+  Header Creation, PFCP-created uplink PDR F-TEID, path-switch activation and
+  N9 intermediate tunnel roles.
 - Identity graph confidence and conflict handling.
 - Attempt segmentation with reused PDU session IDs.
+- Alternative profile persistence and rendering, separate from root-cause
+  alternatives.
 - Retry versus new-attempt decisions.
 - State transition completion and missing stages.
 - Root-cause downstream/cleanup classification.
@@ -1781,6 +2286,9 @@ Metrics:
 - Evidence token-budget trimming.
 - Full-record lookup by event, frame and stream.
 - Pre/post context windows containing correlated and uncorrelated packets.
+- T10 model timeline hard cap of 20 items, closed eight-label taxonomy,
+  candidate/checkpoint evidence references and rejection of diagnostic
+  conclusion mutation.
 - Targeted re-decode argument validation, bounds and provenance.
 - Artifact checksum verification and corruption handling.
 - Model output validation and invalid evidence references.
@@ -1791,7 +2299,10 @@ Metrics:
 - Successful handover cancellation/rollback versus failed rollback.
 - Roaming topology classification and home/visited fault-domain assignment.
 - Home-routed versus local-breakout stage applicability.
-- Interface visibility preventing false missing-stage failures.
+- Reference-point/SBI visibility preventing false missing-stage failures.
+- Release/profile visibility registry validation: `N7`, `N13`, `N35`, `N36`
+  and `N37` are accepted reference points when supported; `Nnrf` is rejected
+  as a reference point and accepted only as SBI service visibility.
 - Capture preamble, active and postamble classification with overlapping UE attempts.
 - Benign NF deregistration `404` followed by successful registration before a call.
 - Unresolved NF registration failure promoted only when the call uses that NF/service.
@@ -1803,10 +2314,56 @@ Metrics:
 - `EvidenceStage`/`ModelPass` legality: final pass without an expanded packet rejected; second expanded generation for one attempt rejected; `primary` packet feeding `final` rejected.
 - Generic `DependencyEvidenceRequest` adaptation to typed T24/T25 requests, including `tool`-based routing with the shared `DEPENDENCY_TIMEOUT_SUSPECTED` reason code and mandatory `initial_evidence_ids` validation.
 - Evidence registry: deterministic `evidence_id` minting, duplicate-mint no-op, divergent-payload collision error, and T18 resolution of every emitted evidence ID with `provider=none`.
+- `primary_internal` capability: T05 can resolve assigned primary evidence
+  fields, but direct IDs, indexes, cursors and selector expansion cannot reach
+  NRF/UDR records without approved dependency capability.
+- Canonical artifact tree publication: descriptor validation rejects path
+  traversal, schema/media mismatch, unverifiable record counts, child
+  checksum mismatch, extra/missing collection members and manifest-before-data
+  publication.
+- Authenticated cursor validation rejects tampered signatures, expired
+  cursors, cross-run reuse, cross-scope reuse, stale artifact revisions and
+  requests outside the original capability bounds.
 - `FailureCandidate` ownership: detectors emit `call_impact="inconclusive"`; only T23-wrapped dependency candidates carry other values; T12 output never mutates a published candidate.
 - Model narration policy: explicit `--attempt`/`--ue` selection, deterministic ordering modes, cap enforcement and skipped-attempt disclosure in manifest/report.
 - Configuration resolver: missing/invalid/checksum-mismatched policy version fails at startup; resolved handles reach detectors through `DetectionContext`.
+- Version vocabulary: release milestone text cannot alter runtime behavior;
+  tools branch only on validated capability gates and resolved configuration.
+- Operational flags: `include_nrf_success`, `include_udr_success` and
+  `unmasked_local_evidence` are persisted, scoped and rejected when unsafe or
+  incompatible with provider/masking policy.
+- Shared provider abstraction: T13 and T16 use `harness/providers` contracts,
+  while T14 remains deterministic and T16 owns diagnosis-call ledgers.
+- Deployment resource profiles cap local provider behavior without depending
+  on specific hardware names or benchmark prose.
+- Secret handling: `secret_ref` and `api_key_env` resolve only inside the
+  provider boundary; raw API-key values in persisted config, manifests,
+  provider ledgers or reports fail validation.
+- NF readiness cardinality: multiple `ServiceRequirement` rows aggregate
+  across candidate NF instances with ready/not-ready/partial/unknown
+  outcomes and missing-observation evidence.
+- Reachability-loss and mobile-terminated delivery ownership across paging,
+  service request, NGAP/PFCP activation and user-plane delivery symptoms.
+- Observability timing checklist emits distinct observed/absent/not-applicable/
+  inconclusive timings with frame-first precision and T17 report rendering.
+- T15 mandatory-evidence guarantee: nonessential details may be shortened,
+  mandatory records are never removed and construction fails before provider
+  invocation when mandatory content cannot fit.
 - Revision envelopes: byte-identical revisions for identical inputs; sibling generation on config change; stale parent revision rejected by section 19.3 lineage validation.
+- Run-store lifecycle: lease acquisition/recovery, descriptor validation
+  before finalize, retention expiry, legal hold and idempotent delete journal.
+- Masking policy: deterministic equality-preserving masks within one policy
+  revision, changed masks across salts, remote-provider forced masking and
+  local unmask rejection when policy disallows it.
+- Report pipeline schema: T17 maps decoder/normalizer/provider/scenario
+  partials to top-level status without treating UE call failure as run
+  failure; golden normalization preserves evidence ordering and conclusions.
+- Logical JSONL schema validation: partition, validation status, issue list,
+  source refs and timestamp precision are validated independently from the
+  physical JSONL file layout.
+- Canonical Decimal/timestamp serialization: no binary floats, RFC 3339 UTC
+  generated datetimes, source timestamp precision preservation and
+  deterministic revision hashes.
 - Baseline selection lexicographic order: higher similarity band beats nearer frame; frame decides only within a band; future success never selected.
 - Every machine-readable issue code emitted by any stage is a registered member of `issue_registry.yaml`; unregistered codes fail validation.
 
@@ -1842,35 +2399,75 @@ Required fixture cases:
 26. Inter-AMF handover with old/new NGAP identifier mapping.
 27. Handover radio success followed by PFCP path-update failure.
 28. Idle mobility with no core procedure, producing no false failure.
-29. 3GPP/non-3GPP access registration and mobility kept separate.
-30. Home-routed roaming registration/session success and home-network failure.
-31. Local-breakout roaming session without false H-SMF/N9 missing-stage errors.
-32. Roaming restriction, unsupported slice and inter-PLMN routing failure.
-33. UE-initiated and network-initiated deregistration.
-34. Normal context release and cleanup after an earlier failure.
-35. A normalized event omits a required body field and full-record lookup recovers it.
-36. Root cause requires packets before and after the explicit failure frame.
-37. Initial decoder output lacks a protocol tree and targeted re-decode recovers it.
-38. Retained artifact checksum mismatch causes an evidence-integrity warning/failure.
-39. Capture starts before NFs; the model requests NRF inspection and recovered deregistration `404` responses remain background only.
-40. NF registration fails before the call; a call-flow discovery symptom triggers NRF inspection and the unresolved state is linked to the attempt.
-41. NRF startup errors exist, but the model makes no dependency request and no NRF records enter model evidence.
-42. A UDM-facing subscriber-data error triggers bounded UDR inspection and reveals the causal UDR failure.
-43. The model requests capture-wide NRF/UDR data and the validator rejects or clamps the request.
-44. A final-pass dependency request is rejected and does not create a third model pass.
-45. Two failed attempts in one run retain disjoint candidate sets, rankings, packets and diagnoses.
-46. T06/T07/T08 may complete in any order, but T09 for an attempt never starts until all three results are published.
-47. No scenario skips T13/T14 without degrading deterministic status; an invalid/partial scenario result does not stop capture analysis.
-48. `provider=none` skips T15/T16/T24/T25 and still publishes a deterministic T17 report for every attempt.
-49. An enabled provider with no dependency request performs one initial pass and no final pass.
-50. Dependency requests from multiple selected attempts complete before one run-level dependency-expanded T14 revision and before any final T16 pass.
-51. T18/T19/T20 remain uninvoked when retained evidence is sufficient and cannot be reached without a bounded capability-checked request.
-52. Direct top-level invocation of T22 or T23 is rejected; both succeed only under their documented T24/T25 parent invocation.
-53. Empty admitted inspection result produces one expanded T12/T15 generation with unchanged primary cause plus an inspected-no-match limitation.
-54. Partial admitted inspection contributes only integrity-valid evidence and preserves missing portions as limitations.
-55. Failed or integrity-invalid inspection is visible in T17 but cannot appear in T12, T14, T15 or final T16 evidence.
-56. NRF and UDR inspections completing in opposite orders produce byte-identical admitted-result ordering, expanded revisions and packet IDs.
-57. Expanded T15 construction fails for stale primary ranking, stale scenario validation, cross-attempt result, duplicate revision or mismatched parent packet.
+29. PFCP Association Setup/Update/Release rejection, timeout and restart
+    before/during a selected attempt.
+30. PFCP Session Report Error Indication and user-plane path failure mapped to
+    the attempt, plus non-failure reports preserved as observations.
+31. Directional F-TEID consistency for uplink/downlink, path switch and N9
+    variants.
+32. Alternative profile reporting for Xn versus incomplete N2, periodic versus
+    mobility registration and home-routed versus local-breakout roaming.
+33. NF readiness with multiple service/version/endpoint requirements and
+    partial NRF observations.
+34. Reachability loss and mobile-terminated delivery failure across paging,
+    service request and user-plane activation.
+35. Observability timing checklist in report JSON/Markdown.
+36. 3GPP/non-3GPP access registration and mobility kept separate.
+37. Home-routed roaming registration/session success and home-network failure.
+38. Local-breakout roaming session without false H-SMF/N9 missing-stage errors.
+39. Roaming restriction, unsupported slice and inter-PLMN routing failure.
+40. Release/profile visibility differentiates reference points from SBI
+    service/API visibility for policy, authentication, NRF and UDR flows.
+41. UE-initiated and network-initiated deregistration.
+42. Normal context release and cleanup after an earlier failure.
+43. A normalized event omits a required body field and full-record lookup recovers it.
+44. Root cause requires packets before and after the explicit failure frame.
+45. Initial decoder output lacks a protocol tree and targeted re-decode recovers it.
+46. Retained artifact checksum mismatch causes an evidence-integrity warning/failure.
+47. Capture starts before NFs; the model requests NRF inspection and recovered deregistration `404` responses remain background only.
+48. NF registration fails before the call; a call-flow discovery symptom triggers NRF inspection and the unresolved state is linked to the attempt.
+49. NRF startup errors exist, but the model makes no dependency request and no NRF records enter model evidence.
+50. A UDM-facing subscriber-data error triggers bounded UDR inspection and reveals the causal UDR failure.
+51. The model requests capture-wide NRF/UDR data and the validator rejects or clamps the request.
+52. A final-pass dependency request is rejected and does not create a third model pass.
+53. Two failed attempts in one run retain disjoint candidate sets, rankings, packets and diagnoses.
+54. T06/T07/T08 may complete in any order, but T09 for an attempt never starts until all three results are published.
+55. No scenario skips T13/T14 without degrading deterministic status; an invalid/partial scenario result does not stop capture analysis.
+56. `provider=none` skips T15/T16/T24/T25 and still publishes a deterministic T17 report for every attempt.
+57. An enabled provider with no dependency request performs one initial pass and no final pass.
+58. Dependency requests from multiple selected attempts complete before one run-level dependency-expanded T14 revision and before any final T16 pass.
+59. T18/T19/T20 remain uninvoked when retained evidence is sufficient and cannot be reached without a bounded capability-checked request.
+60. Direct top-level invocation of T22 or T23 is rejected; both succeed only under their documented T24/T25 parent invocation.
+61. Empty admitted inspection result produces one expanded T12/T15 generation with unchanged primary cause plus an inspected-no-match limitation.
+62. Partial admitted inspection contributes only integrity-valid evidence and preserves missing portions as limitations.
+63. Failed or integrity-invalid inspection is visible in T17 but cannot appear in T12, T14, T15 or final T16 evidence.
+64. NRF and UDR inspections completing in opposite orders produce byte-identical admitted-result ordering, expanded revisions and packet IDs.
+65. Expanded T15 construction fails for stale primary ranking, stale scenario validation, cross-attempt result, duplicate revision or mismatched parent packet.
+66. Canonical run tree contains source, decoder, normalized, evidence, model,
+    report and index descriptors; corrupt or missing descriptor members make
+    the run partial/failed according to stage criticality.
+67. A published T19 context result pages through authenticated cursors; tamper,
+    expiry and stale revision are rejected while the original cursor remains
+    valid for the published revision.
+68. Run finalization followed by retention expiry deletes only when no active
+    lease and no legal hold exist; evidence/report links remain resolvable
+    before expiry.
+69. Remote-provider analysis masks SUPI/GPSI/PEI/GUTI/UE IP, UDR subscriber
+    data and authorization material while preserving equality in one run.
+70. Local unmasked evidence is accepted only with `provider=local`, explicit
+    CLI flag and a policy that permits it; reports and manifests remain
+    masked.
+71. Report JSON uses `pipeline` status fields and golden normalization removes
+    volatile UUID/timestamp/path/duration/provider/revision values without
+    changing deterministic conclusions.
+72. Raw secret values in YAML config, manifest, provider ledger or report are
+    rejected; `api_key_env` and `secret_ref` are the only persisted handles.
+73. Logical canonical events are partitioned into primary/NRF/UDR JSONL files
+    with validation issues; quarantined events do not enter primary detectors.
+74. Decimal timestamps and generated UTC datetimes produce byte-identical
+    revisions across machines; source timestamp precision appears in reports.
+75. Evidence/report links issued before a sibling generation fail as stale
+    rather than resolving to the sibling artifact.
 
 ### 21.3 Orchestration contract tests
 
@@ -1882,9 +2479,18 @@ Store expected deterministic `report.json` files for fixture captures. Model pro
 
 ## 22. Implementation Sequence
 
-1. Implement the shared foundations first: shared model registry (section 23), evidence registry (section 24), revision envelopes (section 25), issue registry (section 26) and the configuration resolver (section 29).
-2. Add Go decoder output-directory support, retain the source PCAP, and emit checksummed raw/full HTTP/NAS/PFCP artifacts plus indexes.
-3. Implement canonical models, partitioned JSONL store, NRF/UDR indexes and protocol normalizers.
+1. Implement the shared foundations first: version vocabulary/capability
+   gates (section 3.1), shared model registry (section 23), artifact
+   descriptors, evidence registry (section 24), revision envelopes (section
+   25), issue registry (section 26), authenticated cursors (section 30),
+   run-store lifecycle (section 31), masking policy (section 32),
+   canonicalization (section 33), protocol codepoint registry and the
+   configuration/resource resolver (section 29).
+2. Add Go decoder output-directory support, retain the source PCAP, and emit
+   checksummed raw/full HTTP/NAS/PFCP artifacts, collection descriptors and
+   indexes in the canonical run tree.
+3. Implement canonical models, logical JSONL validation, partitioned JSONL
+   store, NRF/UDR indexes and protocol normalizers.
 4. Implement identity graph and attempt segmentation.
 5. Add the scenario-profile registry and initial, mobility, periodic, emergency and non-3GPP registration profiles.
 6. Add service request, paging, PDU lifecycle, mobility, handover, roaming, deregistration and NF-dependency profiles.
@@ -1892,7 +2498,8 @@ Store expected deterministic `report.json` files for fixture captures. Model pro
 8. Implement the dependency request validator, NRF inspector, UDR inspector and bounded second model pass.
 9. Add baseline comparison and bounded timeline.
 10. Add scenario parser/validator.
-11. Add evidence builder and privacy masking.
+11. Add evidence builder, authenticated evidence/context lookup and privacy
+    masking.
 12. Add OpenAI-compatible provider and deterministic fallback.
 13. Add reports, CLI, fixtures and golden integration tests.
 
@@ -1913,24 +2520,33 @@ packages.
 | `IdentityEdge`, `UEContext`, `IdentityLinkThresholds` | `models/identity.py` | Section 4.4 |
 | `AccessContextKey`, `AccessRegistrationState` | `models/identity.py` | T03 sections 6.2 and 6.5 |
 | `RoamingTopologyInterval`, `TopologyAlternative`, `TopologyEvidenceTerm`, `FaultDomainMap` | `models/topology.py` | T03 section 4.1; section 10.8 |
-| `ProcedureAttempt`, `StateTransition`, `RetryRecord`, `InterfaceVisibility` | `models/attempts.py` | Sections 4.5, 23.1 |
+| `ProcedureAttempt`, `ProfileSelectionAlternative`, `StageTimingObservation`, `StateTransition`, `RetryRecord`, `InterfaceVisibility` | `models/attempts.py` | Sections 4.5, 23.1, 23.6 |
 | `FailureCandidate`, `ScoreTerm`, `TerminalEffect` | `models/failures.py` | Sections 4.6, 12; T07 section 10 |
-| `EvidenceRecord`, `EvidenceCapability`, cursor envelope | `models/evidence.py` | Sections 24, 30 (in tools/T18 until section 30 lands) |
+| `PFCPAssociationObservation`, `PFCPSessionReportObservation`, `TunnelRoleExpectation`, `PFCPConsistencyResult` | `models/pfcp.py` | Section 11.4; T08 sections 7, 12, 13 |
+| `EvidenceRecord`, `EvidenceCapability`, `CursorEnvelope`, `CursorPage` | `models/evidence.py` | Sections 24, 30 |
 | `EvidenceStage`, `ModelPass` | `models/common.py` | Section 4.10 |
+| `VersionVocabulary`, `CapabilityName` | `models/common.py` | Section 3.1 |
 | `TokenCounterSpec`, `ResolvedTokenBudget`, `ResolvedModelRuntime` | `models/token_budget.py` | Section 29.1; T15 section 4 |
-| `ArtifactDescriptor`, `CollectionDescriptor` | `models/common.py` | Section 23.2 |
+| `ArtifactDescriptor`, `CollectionMemberDescriptor`, `CollectionDescriptor` | `models/common.py` | Section 23.2 |
 | `CaptureMetadata`, `FrameWindow`, `PhaseRoll`, `CapturePhaseInterval`, `CapturePhaseLabel` | `models/phases.py` | Section 23.1; T21 sections 5, 12 |
+| `ProtocolCodepointRegistry` | `models/protocol_registry.py` | Section 6.2; T02 section 9 |
+| `TimelineMode`, `TimelineLabel`, `TimelineItem`, `AttemptTimelineResult` | `models/timeline.py` | Section 13.1; T10 |
 | `EventMatcher`, `ConditionExpression`, profile models | `models/profiles.py` | Section 23.3; `profiles/README.md` |
 | `DetectionContext`, `ResolvedPolicySet` | `models/detection.py` | Sections 11, 29 |
 | `DependencyEvidenceRequest`, `DependencyReasonCode`, `DependencyInspectionResult` | `models/tool_requests.py` | Section 17 |
 | `ExpansionBudget`, `ExpansionDecision` | `models/tool_requests.py` | T24 section 15 |
 | `DependencyEventSummary`, `DependencyBaselineComparison`, `UDRBaselineComparison` | `models/dependency.py` | Section 23.4 |
-| `NFEntityReadiness`, `ServiceRequirement` | `models/dependency.py` | Section 23.4; T22 section 15 |
+| `NFEntityReadiness`, `NFReadinessSnapshot`, `ServiceRequirement` | `models/dependency.py` | Section 23.4; T22 section 15 |
 | Scenario models | `models/scenario.py` | Section 14 pointers |
 | `Issue`, issue codes | `errors.py` | Section 26 |
 | `RunManifest`, `AnalysisState`, `ReportPolicy` | `models/reports.py` | Section 27; T17 section 4 |
-| `MaskedUEIdentity`, masking policy models | `evidence/masking.py` | Section 23.5 |
-| `ProblemDetailsSummary`, `MissingField`, `FieldDifference`, `StageAlignment` | `models/common.py` | Section 23.5 |
+| `ProviderConfig`, `ProviderMetadata` | `models/providers.py` | Section 16; T13/T16 |
+| `RunStoreState`, `RetentionPolicy`, `RunLease` | `models/run_store.py` | Section 31 |
+| `MaskedUEIdentity`, `MaskingPolicy`, `MaskingDecision` | `evidence/masking.py` | Sections 23.5, 32 |
+| `EvidenceIntegrityReport`, `GoldenNormalizationPolicy` | `models/reports.py` | Sections 18, 23.5 |
+| `MandatoryEvidenceSet` | `models/evidence_packet.py` | Section 15; T15 |
+| `DeploymentResourceProfile` | `models/config.py` | Section 29.2 |
+| `ProblemDetailsSummary`, `MissingField`, `FieldDifference`, `StageAlignment`, `CanonicalizationPolicy` | `models/common.py` | Sections 23.5, 33 |
 
 ### 23.1 Attempt and capture support models
 
@@ -1951,9 +2567,15 @@ class RetryRecord(BaseModel):
     same_transaction: bool
     reason_codes: list[str] = Field(default_factory=list)
 
+class VisibilityEvidence(BaseModel):
+    state: VisibilityState
+    evidence_ids: list[UUID] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
 class InterfaceVisibility(BaseModel):
-    observed: dict[str, Literal["visible", "partial", "not_captured"]]
-    evidence_ids: dict[str, list[UUID]] = Field(default_factory=dict)
+    reference_points: dict[str, VisibilityEvidence]
+    sbi_services: dict[str, VisibilityEvidence] = Field(default_factory=dict)
+    sbi_apis: dict[str, VisibilityEvidence] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
 
 class CaptureMetadata(BaseModel):
@@ -1975,8 +2597,15 @@ class PhaseRoll(BaseModel):
     post_seconds: Decimal | None = None
 ```
 
-Interface keys in `InterfaceVisibility.observed` come from the release/profile
-visibility registry (section 10.3), not a hard-coded enum.
+Keys in `InterfaceVisibility.reference_points`, `.sbi_services`, and
+`.sbi_apis` come from the release/profile visibility registry (section 10.3),
+not a hard-coded enum. A key may appear in only one namespace. Condition facts
+project these states into `visibility.<reference_point>`,
+`visibility.service.<service_name>`, and `visibility.api.<api_name>`:
+`visible` becomes `observed`, `not_captured` becomes `not_observed`, and
+`partial`/`unknown` become `unknown`. A stage that can be evaluated with
+partial capture declares `minimum_state="partial"` in its
+`VisibilityRequirement` rather than relying on fact projection.
 
 ### 23.2 Artifact and collection descriptors
 
@@ -1993,6 +2622,16 @@ class ArtifactDescriptor(BaseModel):
     record_count: int | None = None
     creation_stage: str
     parent_source_sha256: str | None = None
+    revision: str | None = None
+
+class CollectionMemberDescriptor(BaseModel):
+    relative_path: str
+    sha256: str
+    byte_size: int
+    record_count: int | None = None
+    artifact_type: str
+    media_type: str
+    format_schema_version: str
 
 class CollectionDescriptor(BaseModel):
     collection_id: UUID
@@ -2001,6 +2640,9 @@ class CollectionDescriptor(BaseModel):
     index_artifact: ArtifactDescriptor
     member_count: int
     members_sha256: str
+    members: list[CollectionMemberDescriptor]
+    parent_source_sha256: str | None = None
+    revision: str | None = None
 ```
 
 `relative_path`/`relative_dir` are run-directory relative, must not contain
@@ -2008,7 +2650,11 @@ class CollectionDescriptor(BaseModel):
 collection (for example HTTP/2 stream documents), `index_artifact` is the
 ordered child index whose entries each carry the member checksum and size;
 `members_sha256` is the checksum over the ordered index entries. Validation of
-a collection requires validating the index and every referenced member.
+a collection requires validating the index and every referenced member. A
+descriptor is invalid if media/schema type mismatches content, record counts
+cannot be verified when declared, a child is missing or extra, parent source
+checksum conflicts, or any path resolves outside the run root after symlink
+resolution.
 
 ### 23.3 Matchers and conditions
 
@@ -2060,20 +2706,48 @@ class UDRBaselineComparison(DependencyBaselineComparison):
     masked_context_equal: bool | None
 
 class ServiceRequirement(BaseModel):
+    requirement_id: UUID
     service_name: str
     api_version: str | None = None
+    endpoint: str | None = None
+    consumer_nf: str | None = None
     required_by_stage: str | None = None
+    optional: bool = False
 
 class NFEntityReadiness(BaseModel):
     entity_id: UUID
-    service_states: dict[str, str]
+    requirement_ids: list[UUID]
+    service_name: str
+    api_version: str | None
+    endpoint: str | None
     status: Literal["ready", "not_ready", "partially_ready", "unknown"]
+    missing_observations: list[MissingField] = Field(default_factory=list)
+    evidence_ids: list[UUID]
+
+class NFReadinessSnapshot(BaseModel):
+    attempt_id: UUID
+    frame: int
+    requirements: list[ServiceRequirement]
+    entities: list[NFEntityReadiness]
+    status: Literal["ready", "not_ready", "partially_ready", "unknown"]
+    available_entity_ids: list[UUID]
+    unresolved_requirement_ids: list[UUID]
+    missing_observations: list[MissingField] = Field(default_factory=list)
     evidence_ids: list[UUID]
 ```
 
 `DependencyBaselineComparison` is the common base used by T23;
 `UDRBaselineComparison` is its only specialization (T25). The two names in
 earlier drafts referred to this single hierarchy.
+
+NF readiness snapshots are keyed by `ServiceRequirement[]`, not by one global
+NF state. T22 records each required service/version/endpoint tuple and then
+aggregates matching `NFEntityReadiness` rows across eligible NF instances:
+all required non-optional tuples ready -> `ready`; at least one required tuple
+proven unavailable -> `not_ready`; mixed ready/missing/partial observations ->
+`partially_ready`; insufficient visibility or selector ambiguity -> `unknown`.
+Missing and partial observations stay attached to the affected requirement so
+T23 can distinguish unavailable service from incomplete NRF evidence.
 
 ### 23.5 Report-facing support models
 
@@ -2108,12 +2782,54 @@ class StageAlignment(BaseModel):
     occurrence: int
     status: Literal["matched", "changed", "missing_in_failed", "extra_in_failed", "not_comparable"]
     evidence_ids: list[UUID]
+
+class EvidenceIntegrityReport(BaseModel):
+    checked_evidence_count: int
+    missing_evidence_ids: list[UUID] = Field(default_factory=list)
+    corrupt_artifact_ids: list[UUID] = Field(default_factory=list)
+    unresolved_source_refs: list[SourceRef] = Field(default_factory=list)
+    status: Literal["valid", "warning", "failed"]
+
+class GoldenNormalizationPolicy(BaseModel):
+    policy_version: str
+    normalize_uuid_fields: list[str]
+    normalize_timestamp_fields: list[str]
+    normalize_path_fields: list[str]
+    normalize_duration_fields: list[str]
+    normalize_provider_metadata: bool = True
+    normalize_revision_digests: bool = True
 ```
 
 The typed warning aliases that appear in tool contracts (`DecodeWarning`,
 `NormalizationWarning`, `IdentityWarning`, `AttemptWarning`,
 `DetectorWarning`) are all the single `Issue` model of section 26 carrying a
 tool-scoped code namespace; they are type aliases, not separate classes.
+
+### 23.6 Observability timing checklist
+
+Every attempt publishes `StageTimingObservation` rows for the checklist below
+when the relevant profile stage exists. Timings are stage observations, not
+diagnoses; `absent`, `not_applicable` and `inconclusive` are distinct states.
+
+| Timing key | Source anchor | Owner |
+|---|---|---|
+| `attempt.trigger` | first profile trigger event or explicit mid-capture basis | T04 |
+| `request.first_ue_or_network_message` | NAS/NGAP initiating frame, paging trigger or network downlink trigger | T04/T05 |
+| `dependency.first_primary_sbi` | first attempt-correlated primary SBI request/response | T06 |
+| `pfcp.first_session_operation` | first mapped PFCP session or association operation | T08 |
+| `access.first_resource_action` | NGAP resource/context setup, modify, release, handover or path-switch frame | T07 |
+| `missing.deadline` | profile timeout deadline after predecessor/trigger | T09 |
+| `terminal.outcome` | terminal success/failure/abort/timeout/capture-boundary frame | T04/T09 |
+| `phase.window` | T21 core and expanded attempt interval | T21 |
+| `dependency.recovery` | T22/T23 recovery or unresolved-at-attempt-start frame | T22/T23 |
+
+Source anchors use frame numbers as the primary ordering key and decimal
+timestamps only when present and validated. `not_applicable` means the
+selected profile/stage condition is false; `absent` means the stage was
+applicable but no matching event was observed with sufficient visibility;
+`inconclusive` means capture bounds, visibility, identity or decoder state do
+not support a positive or absent conclusion. T17 renders these timings in JSON
+for every attempt and in Markdown for failed/incomplete attempts.
 
 ## 24. Evidence Registry
 
@@ -2135,7 +2851,34 @@ class EvidenceRecord(BaseModel):
     observed: dict[str, JsonValue]
     minted_by: str
     revision_scope: str
+
+class EvidenceCapability(BaseModel):
+    capability_id: UUID
+    analysis_id: UUID
+    scope: Literal[
+        "primary_internal",
+        "dependency_inspection",
+        "report_drilldown",
+        "packet_context",
+        "targeted_redecode",
+    ]
+    holder_tool: str
+    attempt_id: UUID | None = None
+    request_id: UUID | None = None
+    partition_allowlist: list[Literal["primary", "nrf", "udr"]]
+    frame_bounds: FrameWindow | None = None
+    selector_hash: str | None = None
+    artifact_revision: str
+    expires_at: datetime | None = None
 ```
+
+`primary_internal` is the capability issued to T05 for local recovery of
+fields from already assigned primary events. It allows only `primary` partition
+source refs for the current attempt and cannot be exchanged for dependency
+reader access. T18 validates capabilities after selector expansion and rejects
+NRF/UDR access through direct evidence IDs, indexes, cursors or broadened
+selectors unless the caller holds an approved dependency-inspection
+capability.
 
 ### 24.2 Identity and minting
 
@@ -2157,17 +2900,22 @@ class EvidenceRecord(BaseModel):
 
 ### 24.3 Storage, deduplication and resolution
 
-- Records append to `normalized/evidence/evidence_records.jsonl`; the storage
+- Records append to `evidence/registry/evidence_records.jsonl`; the storage
   layer maintains `indexes/evidence_index.jsonl` mapping `evidence_id` to
-  byte offset, source events and source refs.
+  byte offset, source events, source refs, artifact descriptor and revision.
 - Minting the same identity twice is a no-op when the payload hash matches and
   an evidence-integrity error when it differs (collision with divergent
   content).
 - T18 resolves `evidence_id -> evidence index -> source events/records`
-  exactly as its section 7 chain describes; report evidence references resolve
-  in `provider=none` runs.
+  exactly as its section 7 chain describes, with the caller's revision or
+  cursor envelope pinned to the same artifact generation. Report evidence
+  references resolve in `provider=none` runs.
 - Records are immutable once the owning generation publishes; superseding
   generations mint new IDs through `revision_scope`.
+- Published evidence IDs remain resolvable for the run retention lifetime
+  unless the run is quarantined for integrity failure. T18 rejects stale,
+  cross-run or cross-revision evidence/cursor combinations instead of
+  resolving them against the nearest available generation.
 
 ## 25. Revision Model
 
@@ -2212,6 +2960,10 @@ class RevisionEnvelope(BaseModel):
 - Compatibility: consumers must reject a parent revision whose
   `schema_version` they do not support, and must surface—not silently
   upgrade—mixed-generation lineages.
+- External references such as evidence IDs, report links and cursor envelopes
+  carry the exact artifact revision they were issued against. Reusing those
+  references after a sibling generation is published is a stale-reference
+  error, not an implicit upgrade.
 
 ## 26. Issue Registry
 
@@ -2270,6 +3022,8 @@ class RunManifest(BaseModel):
     schema_version: Literal["2.0"]
     analysis_id: UUID
     config_hash: str
+    run_store_state: RunStoreState
+    retention_policy: RetentionPolicy
     invocations: list[StageInvocation]
     selected_model_attempt_ids: list[UUID]
     skipped_model_attempt_ids: list[UUID]
@@ -2281,6 +3035,9 @@ class RunManifest(BaseModel):
 `T15:dependency_expanded`, nested T22/T23 invocations). Each invocation's
 `status` uses its tool's documented status vocabulary; the manifest does not
 flatten them into one enum.
+`run_store_state` is the latest section 31 state snapshot at manifest
+publication time; active lease details are omitted from final reports but
+remain in the run-store journal.
 
 ### 27.2 Analysis state
 
@@ -2339,8 +3096,10 @@ narration cap, including the policy values that caused the skip.
 ## 29. Configuration and Policy Resolver
 
 All `*_version` strings (operation policies, cause dictionaries, timeout
-tables, partition rules, ranking/comparison/phase policies, profile registry)
-are resolved once at run startup into immutable handles:
+tables, partition rules, protocol codepoint registry,
+ranking/comparison/phase policies, profile registry, masking policy,
+deployment resource profile and provider/model profile) are resolved once at
+run startup into immutable handles:
 
 ```python
 class ResolvedPolicy(BaseModel):
@@ -2362,6 +3121,7 @@ class ResolvedProfileRegistry(BaseModel):
     supported_releases: list[str]
     supported_deployments: list[str]
     registry: ProfileRegistry
+    visibility_registry: VisibilityRegistry
 ```
 
 - Resolution maps an explicit configured name/version to exactly one file
@@ -2375,10 +3135,12 @@ class ResolvedProfileRegistry(BaseModel):
   latest/default after an explicit version and no lazy mid-run policy loading.
 - Tools receive `ResolvedPolicy` handles via `DetectionContext.policies` or
   their request models; they never load files from bare version strings.
-- T04 receives `ResolvedProfileRegistry`; T11/T12/T13/T14/T21/T22/T23 receive
+- T02 receives `ProtocolCodepointRegistry` and partition policy handles. T04
+  receives `ResolvedProfileRegistry`; T11/T12/T13/T14/T21/T22/T23 receive
   purpose-specific `ResolvedPolicy` handles. T06-T09 read their exact handles
-  from `DetectionContext.policies`. Payloads are immutable/read-only and
-  cannot be refreshed during a run.
+  from `DetectionContext.policies`. Provider setup receives
+  `DeploymentResourceProfile` and model runtime handles. Payloads are
+  immutable/read-only and cannot be refreshed during a run.
 - The resolved set's name/version/checksum triples enter every revision
   envelope (`policy_versions`), making policy drift visible in lineage.
 - `ResolvedPolicySet.revision` is the canonical digest of sorted
@@ -2430,3 +3192,195 @@ loose integers. T16 receives the matching provider config and rejects any
 packet whose counter, budget, prompt revision or measured count differs. Token
 usage reported by local/OpenRouter providers is retained separately for
 observability and never changes deterministic trimming.
+
+### 29.2 Deployment resource profiles
+
+Resource profiles describe local execution constraints without making any
+specific hardware model normative:
+
+```python
+class DeploymentResourceProfile(BaseModel):
+    profile_name: str
+    profile_version: str
+    resource_class: Literal["cpu", "single_gpu", "multi_gpu", "remote"]
+    max_concurrent_provider_calls: int
+    recommended_model_classes: list[str]
+    context_window_tokens: int | None = None
+    quantization: str | None = None
+    memory_floor_gb: Decimal | None = None
+    benchmark_artifact: ArtifactDescriptor | None = None
+```
+
+The resolver may use a resource profile to cap local provider concurrency and
+select compatible model-profile defaults. Benchmarks for particular
+workstations or GPUs are retained as separate artifacts referenced by
+`benchmark_artifact`; they do not change the harness contract.
+
+## 30. Authenticated Cursor Envelope
+
+Continuation cursors are opaque authorization-bearing references, not plain
+pagination offsets. They are used by T10 timeline paging, T18 evidence lookup,
+T19 context windows, T20 targeted re-decode result paging and report-side
+drill-down APIs.
+
+```python
+class CursorPage(BaseModel):
+    offset: int
+    limit: int
+    result_revision: str
+    result_count_hint: int | None = None
+
+class CursorEnvelope(BaseModel):
+    cursor_version: Literal["2.0"] = "2.0"
+    analysis_id: UUID
+    scope: Literal[
+        "attempt_timeline", "evidence_lookup", "packet_context",
+        "targeted_redecode", "report_page"
+    ]
+    capability_id: UUID | None
+    artifact_revision: str
+    run_revision: str
+    subject: dict[str, JsonValue]
+    page: CursorPage
+    issued_at: datetime
+    expires_at: datetime | None
+    nonce: str
+    signature: str
+```
+
+The serialized cursor is `base64url(canonical_json(envelope minus signature))`
+plus a detached signature. The signature is HMAC-SHA-256 with a run-local
+signing key by default, or a configured asymmetric signer when cursors must
+survive process boundaries. The signing key is never persisted in the run
+directory.
+
+Validation is fail-closed:
+
+- `analysis_id`, `scope`, `capability_id`, `artifact_revision` and
+  `run_revision` must match the current request and published artifact.
+- Expired, tampered, cross-run, cross-scope, stale-revision and
+  over-limit cursors are rejected with registered `Issue` codes.
+- A cursor never grants broader access than the original capability. T10,
+  T18, T19 and T20 reapply the original bounds and selectors before reading.
+- Result ordering is part of `result_revision`; adding or removing records
+  creates a new cursor lineage rather than rebinding an old cursor.
+
+## 31. Run Lifecycle and Retention
+
+The run store owns run-root allocation, writer leases, finalization,
+retention and deletion. Analysis code writes only through `RunStore` helpers.
+
+```python
+class RunLease(BaseModel):
+    lease_id: UUID
+    owner: str
+    acquired_at: datetime
+    expires_at: datetime
+    heartbeat_interval_seconds: int
+
+class RetentionPolicy(BaseModel):
+    retention_days: int | None
+    legal_hold: bool = False
+    preserve_source: bool = True
+    preserve_reports: bool = True
+    delete_after: datetime | None = None
+
+class RunStoreState(BaseModel):
+    analysis_id: UUID
+    state: Literal[
+        "allocating", "active", "finalizing", "finalized", "failed",
+        "quarantined", "deleting", "deleted"
+    ]
+    created_at: datetime
+    finalized_at: datetime | None
+    retention_expires_at: datetime | None
+    active_lease: RunLease | None
+    retention_policy: RetentionPolicy
+    state_revision: str
+```
+
+Lifecycle rules:
+
+- `create` allocates a unique run root, creates a writer lease and writes an
+  initial store-state record before any source copy.
+- Only the active lease holder may publish artifacts or update `manifest.json`.
+  Expired leases require explicit recovery that records the previous holder
+  and validates every descriptor before continuing.
+- `finalize` validates descriptors, evidence indexes, report artifacts and
+  manifest lineage, then writes the final manifest last.
+- `failed` and `quarantined` runs retain enough descriptors and logs for
+  evidence-integrity diagnosis; they are not silently deleted.
+- Deletion is legal only when no active lease exists, legal hold is false and
+  retention has expired. Deletion itself is journaled and idempotent.
+- Published evidence IDs, artifact revisions and cursor result revisions must
+  remain resolvable for the retention lifetime unless a run is explicitly
+  quarantined for integrity failure; T17 reports any retained-reference break.
+
+## 32. Masking Policy
+
+Masking is a versioned deterministic transform applied before evidence leaves
+the local evidence boundary. Reports are masked by default; remote providers
+are always masked.
+
+```python
+class MaskingPolicy(BaseModel):
+    policy_version: str
+    salt_ref: str
+    remote_always_mask: bool = True
+    local_unmasked_allowed: bool = False
+    preserve_equality_within_run: bool = True
+    masked_identifier_types: list[str]
+    body_field_rules: dict[str, str]
+
+class MaskingDecision(BaseModel):
+    field_path: str
+    action: Literal["keep", "mask", "hash", "drop", "excerpt"]
+    reason_code: str
+    policy_version: str
+```
+
+Identifier masking uses keyed HMAC with a per-policy salt reference and a type
+prefix, for example `supi:mask_<digest>`. Equality is preserved within a run
+and policy revision but masked values are not stable across unrelated salts.
+SUPI, SUCI, GPSI, PEI, GUTI, UE IP addresses, subscriber-data keys,
+authorization tokens, cookies and raw credentials are masked before remote
+model evidence or report publication. Full retained records stay local and
+are reachable only through bounded T18/T19/T20 capabilities.
+
+`--unmasked-local-evidence` may affect local model packets only when
+`provider="local"` and the resolved policy allows it. It never permits raw
+secrets in persisted config, manifests, provider ledgers or reports.
+`MaskingPolicy.policy_version` and its checksum enter evidence-packet,
+provider-call and report revisions.
+
+## 33. Canonical Numeric and Timestamp Semantics
+
+All persisted deterministic artifacts use one canonical JSON profile:
+
+```python
+class CanonicalizationPolicy(BaseModel):
+    policy_version: Literal["json_canonical_v2"] = "json_canonical_v2"
+    decimal_mode: Literal["plain_string"] = "plain_string"
+    datetime_zone: Literal["UTC"] = "UTC"
+    object_key_order: Literal["lexicographic"] = "lexicographic"
+```
+
+Rules:
+
+- `Decimal` values serialize as plain strings with no exponent, no binary
+  float round-trip and no insignificant trailing zeros except the literal
+  `"0"` where applicable.
+- Frame numbers, byte offsets, counts and sizes are integers. Durations in
+  public reports use integer milliseconds; sub-millisecond source times remain
+  in event timestamps with precision metadata.
+- `CanonicalEvent.timestamp` is absolute Unix-epoch decimal seconds when
+  known. Source precision is recorded in `timestamp_precision`; absent or
+  invalid source time leaves `timestamp=None` and ordering falls back to frame.
+- Generated datetimes such as manifest, lease and cursor times are RFC 3339
+  UTC values with `Z`; local timezone offsets are not persisted.
+- Revision, cursor and deterministic UUID inputs use canonical JSON with
+  sorted object keys, stable list order where order is semantic, and sorted
+  member lists where the contract says order is not semantic.
+- Golden normalization may replace generated datetimes, durations, UUIDs,
+  paths and revision digests, but it must not alter source timestamps, frame
+  order, candidate ordering, status values or evidence references.

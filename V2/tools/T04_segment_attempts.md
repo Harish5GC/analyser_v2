@@ -84,6 +84,7 @@ class ProcedureAttempt(BaseModel):
     access_family: Literal["3gpp", "non_3gpp_untrusted", "non_3gpp_trusted", "unknown"]
     access_anchor_type: Literal["GNB", "N3IWF", "TNGF", "UNKNOWN"]
     profile_id: str
+    profile_alternatives: list[ProfileSelectionAlternative] = Field(default_factory=list)
     procedure_type: str
     subtype: str | None
     sequence_number: int
@@ -100,6 +101,7 @@ class ProcedureAttempt(BaseModel):
     request_signature: dict[str, JsonValue]
     transitions: list[StateTransition]
     retries: list[RetryRecord]
+    stage_timings: list[StageTimingObservation] = Field(default_factory=list)
     outcome: Literal[
         "succeeded", "failed", "aborted", "timed_out", "incomplete_capture"
     ]
@@ -195,6 +197,13 @@ Assignment order:
 
 Each assignment stores confidence and reason codes. An event may be shared between a parent and child attempt only when the profile nesting rule permits it; otherwise it has one owning attempt plus ambiguous candidates.
 
+T04 persists selected, alternative, rejected and disambiguated profile
+candidates for the same trigger window. Each `ProfileSelectionAlternative`
+records profile ID, confidence, score terms, evidence and rationale codes.
+These records explain procedure ambiguity only; T17 renders them separately
+from T12 root-cause alternatives. Disambiguation never rewrites the attempt ID
+or silently removes rejected alternatives from the artifact.
+
 ### 9.1 Access-scoped registration and non-merge rules
 
 T04 reads the T03 `AccessContextKey` and `AccessRegistrationState` active at
@@ -281,7 +290,8 @@ Use `aborted` for explicit cancellation, supersession, successful rollback, or r
 
 Use `timed_out` only when:
 
-- Required interface is visible.
+- Required reference-point, SBI service or SBI API visibility reaches the
+  profile requirement's `minimum_state`.
 - Expected timeout elapsed inside the capture.
 - No terminal response was observed.
 
@@ -291,15 +301,25 @@ Use `incomplete_capture` when the capture starts after required history or ends 
 
 ## 14. Visibility Model
 
-Per attempt, persist observed interfaces and directions:
+Per attempt, persist `InterfaceVisibility` from `LLD.md` section 23.1 using
+the selected release/deployment visibility registry from
+`profile_registry.visibility_registry`. T04 records three disjoint namespaces:
 
-- N1/NAS.
-- N2/NGAP.
-- SBI primary HTTP.
-- N4/PFCP.
-- Relevant access/mobility visibility.
+- `reference_points`: architecture reference points such as `N1`, `N2`, `N4`,
+  `N7`, `N13`, `N27`, `N35`, `N36`, `N37` and profile-applicable mobility
+  links such as `Xn`.
+- `sbi_services`: service-based interfaces such as `Nnrf`, `Nudr`, `Npcf`,
+  `Nausf`, `Namf` and `Nsmf`.
+- `sbi_apis`: concrete API/operation families when stage applicability or
+  diagnostics require finer visibility than the service name.
 
-Profile stages belonging exclusively to an invisible interface cannot cause T04 to declare timeout/failure. Visibility is later consumed by T09 and T14.
+`Nnrf` must not be persisted as a reference point. NRF-to-NRF roaming uses
+`reference_points["N27"]`; NRF service traffic visible in HTTP/SBI uses
+`sbi_services["Nnrf"]`.
+
+Profile stages whose required visibility entries are `not_captured`,
+`partial` below the required minimum, or `unknown` cannot cause T04 to declare
+timeout/failure. Visibility is later consumed by T09 and T14.
 
 ## 15. Request Signature
 
@@ -347,6 +367,8 @@ normalized/attempts/
   event_assignments.jsonl
   ambiguous_assignments.jsonl
   unassigned_events.jsonl
+  profile_alternatives.jsonl
+  stage_timings.jsonl
   attempts_manifest.json
 indexes/
   attempt_index.jsonl
@@ -357,7 +379,10 @@ indexes/
 
 ## 19. Manifest and Revisioning
 
-The manifest records T02/T03 input checksums, profile registry version, configuration hash, counts by profile/outcome/confidence, ambiguous/unassigned counts, timeout use, artifacts, elapsed time, and warnings.
+The manifest records T02/T03 input checksums, profile registry version,
+configuration hash, counts by profile/outcome/confidence,
+profile-alternative counts, ambiguous/unassigned counts, timeout use,
+observability timing coverage, artifacts, elapsed time, and warnings.
 
 Changing profiles or timeout configuration creates a new immutable attempt revision.
 
@@ -447,6 +472,9 @@ V2/harness/models/
 - Parent/child relationship and outcome propagation.
 - Assignment confidence and ambiguity.
 - Request signature exclusion of dynamic values.
+- Profile alternatives with selected/rejected/disambiguated status and stable
+  evidence.
+- Stage timing rows for trigger, terminal and profile-owned anchors.
 
 ### 26.2 Integration tests
 
@@ -461,8 +489,10 @@ V2/harness/models/
 - Access-scoped deregistration for 3GPP, non-3GPP and both-access values.
 - Xn path switch, N2 handover, and inter-AMF handover.
 - Roaming home-routed and local-breakout procedures.
+- Ambiguous profile families persist alternatives until evidence
+  disambiguates them.
 - Capture starting/ending mid-attempt.
-- Missing interface visibility.
+- Missing reference-point/SBI visibility.
 
 ### 26.3 Negative tests
 
@@ -481,7 +511,9 @@ T04 is complete when:
 4. Every assigned event records correlation confidence and evidence.
 5. Ambiguous and unassigned events remain queryable.
 6. Success, failure, abort, timeout, and incomplete-capture are distinguished correctly.
-7. Interface visibility prevents false failure closure.
-8. Attempt IDs and sequence numbers are deterministic.
-9. Supported scenario families have versioned profiles and fixture coverage.
-10. Primary-only data access is enforced.
+7. Reference-point and SBI visibility prevents false failure closure.
+8. Profile alternatives are persisted and never mixed with root-cause alternatives.
+9. Stage timing observations are emitted for applicable trigger/terminal anchors.
+10. Attempt IDs and sequence numbers are deterministic.
+11. Supported scenario families have versioned profiles and fixture coverage.
+12. Primary-only data access is enforced.

@@ -2,7 +2,10 @@
 
 ## 1. Purpose
 
-`decode_capture` is the first harness tool. It validates and retains a PCAP, runs the existing Go/tshark decoders, writes complete protocol artifacts, and returns a validated decoder manifest to Python.
+`decode_capture` is the first harness tool. It validates and retains a PCAP,
+runs the existing Go/tshark decoders, writes complete protocol artifacts under
+the canonical `decoder/` run tree, and returns a validated decoder manifest to
+Python.
 
 The tool performs decoding only. It must not:
 
@@ -10,7 +13,7 @@ The tool performs decoding only. It must not:
 - Filter or classify NRF and UDR traffic.
 - Build UE attempts or correlate subscribers.
 - Produce model evidence.
-- Invoke a local model or OpenRouter.
+- Invoke a model provider.
 
 NRF/UDR partitioning occurs later in `normalize.partition_router` so the decoder output remains complete and protocol-neutral.
 
@@ -36,7 +39,7 @@ The current implementation is not yet compliant with this specification because 
 - Uses destructive lean/sanitize behavior while producing files named as full output.
 - Drops PFCP heartbeat messages.
 - Does not retain streamed raw tshark packet records.
-- Couples the `analyze` command to OpenRouter execution.
+- Couples the `analyze` command to provider execution.
 
 ## 3. Ownership Boundary
 
@@ -63,11 +66,14 @@ The current implementation is not yet compliant with this specification because 
 - Optionally writing a packet-access index for T20 indexed extraction when
   enabled by run policy.
 - Atomic artifact publication and checksums.
+- Minting its own decode revision from source checksum, command options,
+  decoder/tshark versions and published artifact descriptors.
 
 ## 4. Python Tool Contract
 
 ```python
 class DecodeCaptureRequest(BaseModel):
+    schema_version: Literal["2.0"] = "2.0"
     analysis_id: UUID
     retained_pcap_path: Path
     run_dir: Path
@@ -78,15 +84,20 @@ class DecodeCaptureRequest(BaseModel):
     )
     retain_raw_packets: bool = True
     build_packet_access_index: bool = False
+    enabled_capabilities: set[CapabilityName] = Field(default_factory=set)
+    policy_versions: dict[str, str] = Field(default_factory=dict)
 
 
 class DecodeCaptureResult(BaseModel):
     schema_version: Literal["2.0"]
     analysis_id: UUID
     status: Literal["success", "partial", "failed"]
+    revision: str
     source: ArtifactDescriptor
+    manifest: ArtifactDescriptor
     protocols: dict[str, ProtocolDecodeResult]
     artifacts: list[ArtifactDescriptor]
+    collections: list[CollectionDescriptor]
     decoder_version: str
     tshark_version: str
     started_at: datetime
@@ -95,7 +106,16 @@ class DecodeCaptureResult(BaseModel):
     warnings: list[DecodeWarning]
 ```
 
-The wrapper returns only after manifest and artifact validation. It must not infer successful decoding merely from process exit code.
+The wrapper returns only after manifest, descriptor and artifact validation. It
+must not infer successful decoding merely from process exit code.
+`build_packet_access_index=true` is legal only when the resolved run enables
+`bounded_targeted_redecode`; otherwise the request is rejected before invoking
+Go. Declared `policy_versions` are copied into the decode revision envelope so
+later consumers can reject mixed-generation inputs.
+
+`DecodeWarning` is a type alias of the shared `Issue` model with T01-owned
+issue codes. T01 protocol statuses remain local to this tool; T17 maps them to
+run/report `success`, `partial` or `failed`.
 
 ## 5. Go Command Contract
 
@@ -104,7 +124,7 @@ Target command:
 ```bash
 5g_call decode <retained-pcap> \
   --analysis-id <uuid> \
-  --output-dir <run-dir>/decoded \
+  --output-dir <run-dir>/decoder \
   --protocol all \
   --format v2 \
   --retain-raw=true \
@@ -141,10 +161,11 @@ An absent protocol is not a decoder failure. It is recorded as `absent` in the m
 ## 6. Output Layout
 
 ```text
-output/<analysis-id>/
+run/
   source/
     capture.pcap
-  decoded/
+    source_manifest.json
+  decoder/
     decoder_manifest.json
     raw/
       http2.packets.jsonl
@@ -164,21 +185,32 @@ output/<analysis-id>/
     indexes/
       packet_access_index.bin       optional
       packet_access_index.json      optional descriptor
+  staging/
 ```
 
 Every completed or incomplete HTTP/2 stream is a separate JSON document. The filename is a UUIDv4 generated when the stream state is first created. Transport identity remains inside the document and index; the UUID filename must not replace `tcp.stream` or `http2.streamid` as evidence.
 
 NGAP and PFCP remain JSONL because each line is already an independently addressable message record. They may move to separate UUID documents later without changing the Python repository interface.
 
-## 7. Atomic Write Rules
+## 7. Atomic Write and Descriptor Rules
 
-- Create all outputs under `decoded/.staging-<uuid>/`.
+- Create all outputs under `staging/T01-<uuid>/`.
 - Write an individual HTTP document to `<uuid>.json.tmp`, flush, close, and rename to `<uuid>.json`.
-- Write indexes and manifest to temporary files and publish with `os.Rename` only after successful close.
-- Publish `decoder_manifest.json` last.
+- Write indexes, descriptors and manifest to temporary files and publish with `os.Rename` only after successful close.
+- Promote completed files or collections from staging into `decoder/` only
+  after checksums, byte sizes, record counts and collection member indexes
+  validate.
+- Publish `decoder/decoder_manifest.json` last.
 - A manifest may reference only already-published artifacts.
 - The Python wrapper treats a run without a valid manifest as failed.
 - On cancellation, remove staging files but never alter an earlier completed run.
+- Every `relative_path` is run-root relative, uses the `decoder/` or `source/`
+  namespace, and is rejected if absolute, contains `..`, crosses a symlink, or
+  resolves outside the run root.
+- The final `DecodeCaptureResult.revision` is the T01 `RevisionEnvelope`
+  digest over source descriptor, command options, enabled capabilities,
+  decoder/tshark identities, policy versions and artifact/collection
+  descriptors. Callers never mint this revision on T01's behalf.
 
 ## 8. HTTP/2 Stream Identity
 
@@ -314,7 +346,8 @@ All live states must be flushed at end-of-capture. Incomplete streams are eviden
 Required fields:
 
 - Record UUID.
-- Frame number and full epoch timestamp.
+- Frame number and absolute Unix-epoch decimal timestamp with source
+  precision metadata.
 - Source/destination IP and SCTP metadata.
 - Complete tshark NGAP tree.
 - Complete embedded NAS tree when tshark exposes it.
@@ -330,7 +363,8 @@ The full writer must not strip PER blocks or unknown IEs. Key cleanup and semant
 Required fields:
 
 - Record UUID.
-- Frame number and full epoch timestamp.
+- Frame number and absolute Unix-epoch decimal timestamp with source
+  precision metadata.
 - Source/destination IP and UDP ports.
 - Complete tshark PFCP tree.
 - Message type, sequence number, SEID, and response linkage when available.
@@ -338,6 +372,11 @@ Required fields:
 - Raw packet record reference.
 
 Heartbeat requests and responses must remain in full output. Normalization may mark them as routine and omit them from first-pass model evidence, but T01 must not delete them.
+
+T01 preserves PFCP message type, cause and response-linkage fields as observed
+by tshark. It does not emit diagnostic confidence and must not translate
+unknown or unsupported PFCP outcomes into `inconclusive`; that mapping belongs
+to T08/T12.
 
 ## 12. Raw Packet Retention
 
@@ -354,6 +393,9 @@ If one packet belongs to more than one requested protocol filter, retaining it i
   "schema_version": "2.0",
   "analysis_id": "uuid",
   "status": "success",
+  "revision": "sha256:...",
+  "enabled_capabilities": ["jsonl_run_store", "canonical_artifact_revisions"],
+  "policy_versions": {},
   "decoder": {
     "name": "5g_call",
     "version": "build-version",
@@ -361,7 +403,7 @@ If one packet belongs to more than one requested protocol filter, retaining it i
     "tshark_version": "TShark ..."
   },
   "source": {
-    "relative_path": "../source/capture.pcap",
+    "relative_path": "source/capture.pcap",
     "sha256": "hex",
     "byte_size": 123456
   },
@@ -390,8 +432,9 @@ If one packet belongs to more than one requested protocol filter, retaining it i
     }
   },
   "artifacts": [],
-  "started_at": "RFC3339Nano",
-  "completed_at": "RFC3339Nano",
+  "collections": [],
+  "started_at": "2026-06-10T00:00:00.000000000Z",
+  "completed_at": "2026-06-10T00:00:01.200000000Z",
   "elapsed_ms": 1200
 }
 ```
@@ -413,23 +456,40 @@ Every artifact entry includes:
 - Byte size.
 - Record count.
 - Creation stage.
+- Parent source checksum.
+- T01 revision when published.
 
-For collections containing many HTTP stream documents, the manifest may describe the collection and its index rather than duplicating every document entry. `stream_index.jsonl` must contain each document checksum and size, and the collection descriptor must contain a checksum over the ordered index entries. Python validates the index and every referenced document before the collection is accepted.
+For collections containing many HTTP stream documents, the manifest describes
+the collection and its index rather than duplicating every document entry.
+`stream_index.jsonl` must contain each document checksum, byte size, record
+count where applicable and media/schema type. The `CollectionDescriptor`
+contains member count, checksum over ordered index entries, parent source
+checksum and revision. Python validates the index and every referenced
+document before the collection is accepted.
+
+Manifest timestamps are generated RFC 3339 UTC values with `Z`. Packet and
+protocol record timestamps remain absolute Unix-epoch decimal strings with
+source precision preserved. Manifest JSON uses canonical serialization for
+revision input: sorted object keys, Decimal-as-string and stable list order.
 
 Absolute host paths must not be written to portable manifests or reports.
 
 ### 13.1 Optional packet-access index
 
-When `--packet-access-index=true`, T01 performs one streaming pass over the
-retained, materialized capture and publishes a versioned index usable by T20.
-The index is an optimization and evidence-access artifact, not a replacement
-for the source PCAP.
+When `--packet-access-index=true`, and only when the
+`bounded_targeted_redecode` capability is enabled, T01 performs one streaming
+pass over the retained, materialized capture and publishes a versioned index
+usable by T20. The index is an optimization and evidence-access artifact, not
+a replacement for the source PCAP.
 
 Each packet entry records at least source frame number, timestamp, packet/block
 offset and length, captured/original length, pcapng section/interface identity
 and the metadata-block key required to reconstruct a valid slice. The
 descriptor records source checksum/size/format, index schema/version, entry
-count, first/last frame/time, index checksum/size and construction timing.
+count, first/last frame/time, index checksum/size, construction timing and
+whether source-size-independent extraction is supported. T20 may claim
+source-size-independent extraction only when this descriptor says the index is
+complete and reconstruction-capable.
 
 For pcapng, extraction must also copy required section header, interface
 description and other interpretation-critical blocks. An index that cannot
@@ -446,7 +506,9 @@ T20 access, index failure is a critical T01 failure.
 ## 14. Failure Semantics
 
 - Unreadable PCAP: fail before starting protocol jobs.
-- Output directory already contains a published decode generation: reject with exit `2` (re-runs create a new run directory; published generations are immutable per `LLD.md` section 25).
+- `decoder/` already contains a published decode generation: reject with exit
+  `2` (re-runs create a new run directory or sibling run; published
+  generations are immutable per `LLD.md` section 25).
 - tshark unavailable: fail the command.
 - One protocol absent: continue; mark `absent`.
 - One protocol fails while another succeeds: publish valid artifacts and mark overall `partial`.
@@ -574,6 +636,10 @@ Only `runner.py` is exposed to `orchestrator.py`. Downstream normalization recei
 
 ### 20.1 Unit tests
 
+- Command construction uses an argument array and writes to `decoder/`, never
+  legacy fixed filenames or shell-expanded paths.
+- Decode request validation rejects `build_packet_access_index=true` without
+  the `bounded_targeted_redecode` capability.
 - Duplicate HTTP header preservation.
 - Request and response body segmentation.
 - Multipart body with JSON and binary parts.
@@ -584,8 +650,17 @@ Only `runner.py` is exposed to `orchestrator.py`. Downstream normalization recei
 - PFCP heartbeat retention.
 - Atomic writer cleanup after failure.
 - Manifest checksum and record-count generation.
+- ArtifactDescriptor and CollectionDescriptor validation: relative paths,
+  media/schema type, parent source checksum, child member checksums, record
+  counts and symlink/traversal rejection.
+- Decode revision determinism for identical source checksum, command options,
+  capabilities, decoder/tshark versions and artifact descriptors.
+- Canonical timestamps: generated manifest times are RFC 3339 UTC; packet
+  times are Unix-epoch decimal strings with source precision metadata.
 - Classic pcap and multi-interface pcapng packet-access index entries.
 - Index descriptor/source checksum and pcapng metadata-block reconstruction.
+- PFCP unknown/unsupported message state is preserved as observed data and is
+  never converted to diagnostic `inconclusive` by T01.
 
 ### 20.2 Integration tests
 
@@ -599,7 +674,12 @@ Only `runner.py` is exposed to `orchestrator.py`. Downstream normalization recei
 - Corrupt or unreadable PCAP.
 - Manifest tampering detected by Python validation.
 - T20 indexed extraction of early/middle/late frame and time windows.
+- T20 request on a run without a T20-capable packet-access descriptor falls
+  back to the documented scan-preslice path or fails closed according to T20
+  policy; T01 does not advertise unsupported random access.
 - Optional index failure yields partial T01; required index failure is fatal.
+- Re-decode into a run with a published T01 revision is rejected without
+  mutating the existing `decoder/` tree.
 - Performance comparison against the current approximately 3,500 packets/second baseline.
 
 ## 21. Acceptance Criteria
@@ -607,15 +687,23 @@ Only `runner.py` is exposed to `orchestrator.py`. Downstream normalization recei
 T01 is complete when:
 
 1. It runs through one stable Go `decode` command.
-2. It writes only inside the assigned run directory.
+2. It writes only inside the assigned run directory using the canonical
+   `source/`, `decoder/` and `staging/` tree.
 3. Every HTTP/2 stream has a UUID-named full JSON document and index entry.
 4. Duplicate headers, original body bytes, frame references, and incomplete streams are retained.
 5. Full NGAP/NAS and PFCP records are streamed without lean filtering or heartbeat removal.
 6. Raw packet-level artifacts are retained when configured.
-7. A manifest reports protocol status, counts, versions, timings, warnings, checksums, and sizes.
+7. A manifest reports protocol status, counts, versions, capabilities,
+   policy versions, timings, warnings, checksums, sizes, artifacts,
+   collections and the T01 revision.
 8. Python validates every referenced artifact before normalization begins.
 9. Partial protocol failure does not destroy usable outputs.
 10. No NRF/UDR filtering, diagnosis, or model invocation occurs in T01.
 11. Performance is benchmarked against the current decoder on the same capture and host.
 12. When enabled, the packet-access index is immutable, source-checksummed,
     pcap/pcapng reconstruction-capable and independently benchmarked.
+13. Descriptor validation rejects absolute paths, traversal, symlink escapes,
+    checksum drift, record-count mismatch and missing/extra collection
+    members.
+14. Identical inputs and resolved options produce byte-identical T01
+    revisions and manifest descriptor content across supported machines.

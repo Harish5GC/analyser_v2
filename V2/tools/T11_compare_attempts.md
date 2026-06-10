@@ -54,7 +54,7 @@ A baseline must:
 - Have `outcome=succeeded`.
 - Precede the failed attempt. Future-success baselines belong to the same
   deferred capability.
-- Have sufficient interface visibility for compared stages.
+- Have sufficient reference-point/SBI visibility for compared stages.
 - Match emergency/non-emergency and relevant access context.
 - Match roaming topology/fault-domain expectations where applicable.
 - Consume the persisted T03 topology interval/revision; do not independently

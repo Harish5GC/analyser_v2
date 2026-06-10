@@ -4,7 +4,7 @@
 
 `detect_missing_transitions` finds implicit failures where a procedure stops before an applicable mandatory stage and no explicit protocol failure fully explains the stop.
 
-The tool identifies the last completed stage and first missing mandatory stage while distinguishing network timeout, interface invisibility, conditional non-applicability, and capture truncation.
+The tool identifies the last completed stage and first missing mandatory stage while distinguishing network timeout, missing visibility, conditional non-applicability, and capture truncation.
 
 ## 2. Non-Goals
 
@@ -13,7 +13,8 @@ T09 must not:
 - Invent a missing stage from a generic universal call flow.
 - Treat optional or non-applicable stages as failures.
 - Declare timeout when the capture ends before the configured interval.
-- Diagnose a stage belonging to an uncaptured interface.
+- Diagnose a stage whose required reference point, SBI service or SBI API was
+  not captured.
 - Replace explicit failures from T06-T08.
 - Read NRF/UDR partitions.
 
@@ -25,8 +26,8 @@ T09 must not:
 - Existing explicit candidates from T06-T08 for suppression/linking. T09 runs
   only after all three explicit detectors for the attempt have published.
 - The shared attempt-scoped `DetectionContext` (`LLD.md` section 11), carrying
-  capture bounds, interface visibility, the T21 phase reader and the resolved
-  timeout-policy handle.
+  capture bounds, reference-point/SBI visibility, the T21 phase reader and the
+  resolved timeout-policy handle.
 
 T09 receives primary attempt data only. It is the sole owner of implicit
 missing-transition/missing-response candidates; T07/T08 request-only
@@ -66,7 +67,7 @@ class StageDefinition(BaseModel):
     repeatable: bool = False
     terminal_success: bool = False
     terminal_failure: bool = False
-    interface_requirements: set[str]
+    visibility_requirements: list[VisibilityRequirement]
     event_matchers: list[EventMatcher]
     timeout_rule_id: str | None
     predecessor_ids: set[str]
@@ -78,6 +79,13 @@ Conditions are declarative, allowlisted expressions over attempt/request/visibil
 ## 6. Stage Result Contract
 
 ```python
+class StageVisibilityResult(BaseModel):
+    domain: Literal["reference_point", "sbi_service", "sbi_api"]
+    key: str
+    state: VisibilityState
+    minimum_state: Literal["visible", "partial"]
+    satisfied: bool
+
 class StageResult(BaseModel):
     stage_id: str
     status: Literal[
@@ -88,7 +96,8 @@ class StageResult(BaseModel):
     matched_frames: list[int]
     expected_after_frame: int | None
     timeout_at: Decimal | None
-    interface_visible: bool
+    visibility_satisfied: bool
+    visibility_results: list[StageVisibilityResult]
     reason_codes: list[str]
 ```
 
@@ -115,7 +124,8 @@ An incompatible profile is a segmentation/profile warning, not a missing-stage f
 4. Resolve repeatable stages into one or more occurrences.
 5. Verify predecessor/order constraints while allowing legal optional branches.
 6. Mark completed, legally skipped, optional absent, or not applicable stages.
-7. For remaining mandatory stages, evaluate visibility and timeout.
+7. For remaining mandatory stages, evaluate all resolved visibility
+   requirements and timeout.
 8. Identify the first causal missing/timed-out stage.
 9. Mark later missing stages downstream and do not emit separate primary candidates.
 
@@ -130,7 +140,8 @@ If an earlier explicit T06-T08 candidate already explains why the stage was not 
 Timeout starts from a stage-specific anchor such as request frame/timestamp or prior completed stage. A timeout candidate requires:
 
 - Timestamp available or a validated frame-based fallback.
-- Required interface visible during the interval.
+- Every required reference-point, SBI service or SBI API visibility entry
+  reaches the profile requirement's `minimum_state` during the interval.
 - Capture extends beyond timeout plus configured tolerance.
 - No matching response/terminal event.
 - Attempt not explicitly aborted/superseded earlier.
@@ -146,14 +157,16 @@ Timeout policies record source/rationale and may vary by procedure/stage/vendor 
 
 T09 must cite exact capture first/last frame/time in its reasoning.
 
-## 12. Interface Visibility
+## 12. Visibility Evaluation
 
-Visibility is evaluated per stage, not once for the whole attempt. Examples:
+Visibility is evaluated per stage and per namespace, not once for the whole
+attempt. Examples:
 
 - N1 encrypted: NAS semantic stage may be invisible while NGAP outer stage is visible.
 - N4 absent from capture: no PFCP missing-stage failure.
-- SBI primary visible but NRF/UDR hidden by design: T09 cannot declare hidden dependency stage missing.
-- Handover preparation interface absent: path-switch-only profile applies.
+- SBI primary visible but NRF/UDR hidden by design: T09 cannot declare hidden
+  dependency stage missing.
+- Handover preparation visibility absent: path-switch-only profile applies.
 
 ## 13. Repeatable and Retry Stages
 
@@ -178,7 +191,7 @@ T09 candidate category is `missing_transition` or `procedure_timeout` and includ
 
 - Last completed stage/event/frame.
 - First missing stage.
-- Expected interface/message.
+- Expected visibility key and message.
 - Timeout anchor/deadline.
 - Visibility/capture evidence.
 - Existing explicit candidate link.
@@ -210,7 +223,7 @@ normalized/diagnostics/failure_candidates.jsonl
 
 - Missing/invalid profile: fail T09 for attempt and report profile error.
 - Condition evaluation error: mark affected stage inconclusive and detector partial.
-- Unknown interface visibility: inconclusive.
+- Unknown reference-point/SBI visibility: inconclusive.
 - Timestamp unavailable: use frame fallback only when policy allows; otherwise inconclusive.
 - Existing explicit terminal before expected stage: no missing-stage candidate after terminal.
 - Output/persistence failure: fatal for diagnostic revision.
@@ -234,7 +247,9 @@ normalized/diagnostics/failure_candidates.jsonl
 
 Logs include attempt/profile, stage ID, applicability/status, matched frames, timeout rule, visibility result, candidate ID, and warning code.
 
-Metrics include missing/timed-out/inconclusive stages by profile, capture-boundary suppressions, invisible-interface suppressions, duplicate suppression due to explicit candidate, and detector latency.
+Metrics include missing/timed-out/inconclusive stages by profile,
+capture-boundary suppressions, visibility suppressions, duplicate suppression
+due to explicit candidate, and detector latency.
 
 ## 21. Proposed Python Code Structure
 
@@ -272,7 +287,7 @@ V2/harness/config/
 - First missing stage selection.
 - Timeout anchor/deadline/tolerance.
 - Capture start/end and timestamp fallback.
-- Interface visibility per stage.
+- Reference-point/SBI visibility per stage.
 - Explicit candidate duplicate suppression.
 - Deterministic candidate ID.
 
@@ -292,7 +307,7 @@ V2/harness/config/
 - Registration Accept without an acknowledgement trigger and no Registration
   Complete produces no failure; required-ack, no-ack and unknown-field
   fixtures cover initial, mobility and periodic profiles.
-- Invisible interface produces no failure.
+- Invisible reference point, SBI service or SBI API produces no failure.
 - Later downstream missing stages produce no independent primary candidate.
 - Hidden NRF/UDR stage is not evaluated by T09.
 
@@ -303,7 +318,7 @@ T09 is complete when:
 1. Missing transitions are evaluated against the exact attempt profile/version.
 2. Only applicable mandatory stages can generate candidates.
 3. The first causal missing stage is distinguished from downstream absence.
-4. Timeout requires sufficient interface and capture visibility.
+4. Timeout requires sufficient reference-point/SBI and capture visibility.
 5. Repeatable/parallel/conditional branches are handled deterministically.
 6. Explicit T06-T08 failures are linked rather than duplicated.
 7. Every result cites matched/expected stages, frames, timeout, and visibility.

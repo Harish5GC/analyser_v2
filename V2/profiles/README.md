@@ -89,6 +89,23 @@ The inherited `ProcedureProfile` fields remain exactly those in T04 section
 dimensions. The equivalent `ProcedureDefinition` in `../LLD.md` section 10 is
 the state-engine projection of this same resolved object, not a second schema.
 
+Visibility requirements use the `VisibilityRequirement` model from
+`../LLD.md` section 10.3. Source YAML stores `domain` and `key`, not a single
+flat interface enum:
+
+```python
+class VisibilityRequirement(BaseModel):
+    domain: Literal["reference_point", "sbi_service", "sbi_api"]
+    key: str
+    evidence_matchers: list[EventMatcher]
+    required_for_missing_stage_failure: bool
+    minimum_state: Literal["visible", "partial"] = "visible"
+```
+
+`domain=reference_point` is reserved for architecture reference points such as
+`N7`; service-based interfaces such as `Nnrf` use `domain=sbi_service`, and
+concrete HTTP/SBI APIs use `domain=sbi_api`.
+
 Every `stage_id` is unique within a `profile_id` and remains stable across
 compatible profile versions and overlays. Stage display names may change;
 stage identity may not.
@@ -188,14 +205,70 @@ vocabulary. Adding a fact requires a schema-versioned registry change.
 | `attempt.registration_accept_requires_ack` | boolean or unknown, derived by the selected release rule from the decoded Registration Accept | T02/T04 profile projection |
 | `visibility.<reference_point>` | `observed`, `not_observed`, `unknown` | `DetectionContext.visibility` |
 | `visibility.service.<service_name>` | `observed`, `not_observed`, `unknown` | release/profile visibility registry |
+| `visibility.api.<api_name>` | `observed`, `not_observed`, `unknown` | release/profile visibility registry |
 | `profile.release` | resolved release identifier | profile resolver |
 | `profile.deployment_profile` | resolved deployment identifier | profile resolver |
 | `profile.feature.<feature_id>` | boolean or unknown; feature ID declared in `registry.yaml` | profile resolver |
 | `scenario.expected_outcome` | `success`, `failure`, `unknown` or absent | T13/T14 |
 | `scenario.named_variant` | allowlisted variant ID or absent | T13/T14 |
 
-`<reference_point>`, `<service_name>`, and `<feature_id>` are validated against
-the selected release/deployment registry; they are not free-form namespaces.
+`<reference_point>`, `<service_name>`, `<api_name>`, and `<feature_id>` are
+validated against the selected release/deployment registry; they are not
+free-form namespaces. For visibility facts, persisted `visible` projects to
+`observed`, `not_captured` projects to `not_observed`, and `partial` or
+`unknown` projects to `unknown`. A stage that can use partial capture declares
+`minimum_state="partial"` in `VisibilityRequirement`.
+
+### 4.1 Release/Profile Visibility Registry
+
+`registry.yaml` owns a visibility registry for each supported release and
+deployment. The registry validates keys used by profile stages, scenario
+conditions and `InterfaceVisibility` output:
+
+```python
+class ReferencePointVisibilityEntry(BaseModel):
+    key: str
+    endpoint_roles: tuple[str, str]
+    supported_releases: list[str]
+    supported_deployment_profiles: list[str]
+    realized_by_sbi_services: list[str] = Field(default_factory=list)
+
+class SBIServiceVisibilityEntry(BaseModel):
+    service_name: str
+    producer_nf: str
+    supported_releases: list[str]
+    supported_deployment_profiles: list[str]
+    api_names: list[str] = Field(default_factory=list)
+
+class SBIAPIVisibilityEntry(BaseModel):
+    api_name: str
+    service_name: str
+    supported_releases: list[str]
+    supported_deployment_profiles: list[str]
+
+class VisibilityRegistryIndex(BaseModel):
+    reference_points: list[ReferencePointVisibilityEntry]
+    sbi_services: list[SBIServiceVisibilityEntry]
+    sbi_apis: list[SBIAPIVisibilityEntry]
+```
+
+The selected release/deployment profile must include every visibility key used
+by its resolved procedure profiles. For V2 procedure coverage, the
+reference-point registry must include these entries when the release supports
+the related family:
+
+| Key | Endpoint roles | Primary use |
+|---|---|---|
+| `N7` | SMF, PCF | SM policy and charging/policy association visibility |
+| `N13` | UDM, AUSF | Authentication-vector and authentication-family visibility |
+| `N35` | UDM, UDR | UDR-backed subscriber/authentication data visibility |
+| `N36` | PCF, UDR | UDR-backed policy data visibility |
+| `N37` | NEF, UDR | UDR-backed exposure data visibility |
+
+`Nnrf`, `Nudr`, `Npcf`, `Nausf`, and similar names are service-based
+interfaces and must not appear under `reference_points`. When a profile needs
+NRF-to-NRF roaming visibility it uses reference point `N27`; when it needs the
+NRF service seen in HTTP/SBI traffic it uses `sbi_service=Nnrf`.
 
 ## 5. Ordering and State Semantics
 
@@ -301,6 +374,12 @@ class ProfileRegistry(Protocol):
         deployment_profile: str,
     ) -> tuple[ResolvedProcedureProfile, ...]: ...
 
+    def visibility(
+        self,
+        release: str,
+        deployment_profile: str,
+    ) -> VisibilityRegistryIndex: ...
+
     def validate_all(self) -> RegistryValidationReport: ...
 ```
 
@@ -312,7 +391,8 @@ Resolution steps are deterministic:
 3. Verify requested release and deployment support.
 4. Select overlays by the fixed precedence in section 3.
 5. Apply patches by declared list order after rejecting conflicts.
-6. Validate the merged runtime schema, graph, facts and traceability metadata.
+6. Validate the merged runtime schema, graph, visibility requirements, facts
+   and traceability metadata.
 7. Serialize canonical JSON and compute `resolved_revision` using section 7.
 8. Cache by registry revision, profile ID, release and deployment. Return an
    immutable object.
@@ -368,6 +448,28 @@ one versioned fixture and owner. Generated or sanitized fixture PCAP
 provenance follows backlog item V2-062. CI completeness enforcement is owned
 by V2-054.
 
+## 8.1 Profile Alternatives, Reachability and Timings
+
+Profile selection must retain near-miss alternatives returned by
+`ProfileRegistry.candidates(...)`. T04 persists the selected profile plus
+alternative/rejected/disambiguated profile records with score terms,
+confidence, evidence and rationale. These records explain procedure ambiguity
+only; they must not be rendered as root-cause alternatives.
+
+Paging, reachability loss and mobile-terminated delivery profiles declare the
+handoff between network-triggered paging, UE service response, access resource
+activation and user-plane delivery. Missing paging/service response is owned
+by T09 only when the selected profile's visibility and timeout requirements
+are satisfied. Explicit NGAP access/resource failures are T07 evidence.
+Mapped PFCP Session Report Error Indication or user-plane path failure is T08
+evidence. Downlink Data, Usage and other non-failure Session Reports remain
+observations unless a profile/cause rule promotes them.
+
+Every supported profile declares the timing keys from `../LLD.md` section
+23.6 that apply to its stages. A missing timing key is allowed only when the
+stage is `not_applicable`; an applicable but unseen key is `absent` or
+`inconclusive` according to visibility, identity and capture bounds.
+
 ## 9. Requirements Traceability
 
 Status `contract_only` means the profile ID and required fixture set are
@@ -379,9 +481,9 @@ support.
 |---|---|---|---|
 | 8.1 registration family | `registration.initial`, `registration.mobility_update`, `registration.periodic_update`, `registration.emergency`, `registration.non_3gpp` | `reg-initial-success`, `reg-mobility-context-transfer`, `reg-periodic-complete-conditional`, `reg-emergency-limited-service`, `reg-non3gpp-coexisting-access`, `reg-retry-new-attempt` | `contract_only` |
 | 8.2 authentication, identity and NAS security | `auth.identity`, `auth.primary`, `auth.nas_security`, plus nested variants of registration/service profiles | `auth-success`, `auth-sync-failure-recovery`, `auth-reject`, `auth-udm-http-failure`, `nas-security-reject` | `contract_only` |
-| 8.3 service request and paging | `service.ue_request`, `service.network_triggered`, `service.paging` | `service-mo-data-success`, `service-emergency`, `service-context-missing`, `paging-response-delivery`, `paging-timeout`, `paging-multi-access` | `contract_only` |
+| 8.3 service request and paging | `service.ue_request`, `service.network_triggered`, `service.paging`, `service.mt_delivery` | `service-mo-data-success`, `service-emergency`, `service-context-missing`, `paging-response-delivery`, `paging-timeout`, `paging-multi-access`, `mt-delivery-user-plane-failure` | `contract_only` |
 | 8.4 PDU session lifecycle | `pdu.establishment`, `pdu.emergency_establishment`, `pdu.modification`, `pdu.release` | `pdu-establish-success`, `pdu-establish-tenth-fails`, `pdu-emergency-policy`, `pdu-modify-qos`, `pdu-release-ue`, `pdu-release-cleanup`, `pdu-multi-session` | `contract_only` |
-| 8.5 idle-mode mobility | `mobility.idle_reselection`, `registration.mobility_update`, `registration.periodic_update`, `service.paging`, `service.ue_request`, `mobility.reachability_loss` | `idle-radio-only-no-core-failure`, `idle-tau-registration`, `idle-periodic`, `idle-release-resume`, `idle-mt-unreachable` | `contract_only` |
+| 8.5 idle-mode mobility | `mobility.idle_reselection`, `registration.mobility_update`, `registration.periodic_update`, `service.paging`, `service.ue_request`, `mobility.reachability_loss` | `idle-radio-only-no-core-failure`, `idle-tau-registration`, `idle-periodic`, `idle-release-resume`, `idle-mt-unreachable`, `reachability-loss-invisible-access` | `contract_only` |
 | 8.6 connected mobility and handover | `handover.xn`, `handover.n2`, `handover.inter_amf`, `handover.path_switch`, `handover.rollback` | `ho-xn-path-switch`, `ho-n2-success`, `ho-n2-preparation-failure`, `ho-inter-amf-context-transfer`, `ho-core-path-update-failure`, `ho-rollback-success`, `ho-rollback-failure` | `contract_only` |
 | 8.7 inter-system and access mobility | `mobility.5gs_to_eps_n26`, `mobility.5gs_to_eps_no_n26`, `mobility.eps_fallback`, `mobility.eps_to_5gs`, `mobility.access_transfer` | `mobility-n26`, `mobility-no-n26`, `mobility-eps-fallback`, `mobility-return-5gs`, `mobility-3gpp-non3gpp`, `mobility-invisible-radio` | `contract_only` |
 | 8.8 roaming family | `roaming.registration`, `roaming.pdu_home_routed`, `roaming.pdu_local_breakout`, plus roaming overlays for handover profiles | `roaming-registration-home-auth`, `roaming-registration-restricted`, `roaming-home-routed`, `roaming-local-breakout`, `roaming-handover-anchor`, `roaming-topology-inconclusive` | `contract_only` |
@@ -398,6 +500,9 @@ support.
 | 16. Correlate path switch, SBI and PFCP updates | `handover.path_switch`; `ho-xn-path-switch`, `ho-core-path-update-failure` | `contract_only` |
 | 17. Classify roaming topology correctly | `roaming.registration`, `.pdu_home_routed`, `.pdu_local_breakout`; roaming fixture set in 8.8 | `contract_only` |
 | 18. Invisible mandatory stage is inconclusive | Every profile with `visibility_requirements`; `mobility-invisible-radio`, `roaming-topology-inconclusive`, plus one invisible-interface fixture per supported family | `contract_only` |
+| Profile alternatives stay separate from root-cause alternatives | Xn/incomplete-N2, periodic/mobility and roaming topology ambiguity fixtures | `contract_only` |
+| Reachability and MT delivery failures have owners | `service.paging`, `service.mt_delivery`, `mobility.reachability_loss`; `paging-timeout`, `mt-delivery-user-plane-failure`, `idle-mt-unreachable` | `contract_only` |
+| Observability timings are complete | Every supported profile's timing-key declarations plus `timing-checklist-full` and `timing-checklist-inconclusive` fixtures | `contract_only` |
 
 ## 10. Registry Index Contract
 
@@ -419,13 +524,17 @@ class ProfileRegistryIndex(BaseModel):
     schema_version: Literal["2.0"] = "2.0"
     registry_version: str
     entries: list[RegistryProfileEntry]
+    visibility: VisibilityRegistryIndex
     facts: list[str]
     feature_ids: list[str]
     checksum: str
 ```
 
 Entries are sorted by `profile_id`; lists with semantic set behavior are
-sorted before canonical serialization. A `supported` entry with no owner,
-release, deployment, terminal definition, requirement reference or fixture is
-invalid. Unknown files are reported and ignored; they cannot become active by
-being dropped into the directory.
+sorted before canonical serialization. Visibility entries are sorted by
+namespace and key; duplicate keys inside a namespace, reference-point/service
+namespace collisions, and any `VisibilityRequirement` key missing from the
+selected release/deployment registry are validation errors. A `supported`
+entry with no owner, release, deployment, terminal definition, requirement
+reference or fixture is invalid. Unknown files are reported and ignored; they
+cannot become active by being dropped into the directory.

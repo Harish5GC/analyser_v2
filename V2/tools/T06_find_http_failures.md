@@ -25,7 +25,7 @@ T06 receives:
 - One `ProcedureAttempt`.
 - Attempt-assigned HTTP2 events from `PrimaryEventReader`.
 - The shared attempt-scoped `DetectionContext` (`LLD.md` section 11), which
-  carries capture bounds, the T21 phase reader, interface visibility,
+  carries capture bounds, the T21 phase reader, reference-point/SBI visibility,
   assignment confidence and the resolved SBI operation policy handle.
 
 It returns candidates, retry groups, and dependency suspicions. It cannot construct `NRFEventReader` or `UDREventReader`.

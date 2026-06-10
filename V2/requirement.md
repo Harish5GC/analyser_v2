@@ -242,6 +242,10 @@ Each PFCP message must retain:
 - Node IDs.
 - PFCP cause.
 - PDR, FAR, QER, URR, BAR, F-TEID, QFI, UE IP, DNN/network instance, and S-NSSAI fields needed for diagnosis.
+- Association Setup/Update/Release, node recovery timestamp and node-pair
+  availability fields.
+- Session Report Request/Response report type and mapped SEID/F-TEID/user
+  plane path fields.
 - Missing response or retransmission state.
 
 ## 6. Canonical Data Requirements
@@ -476,9 +480,16 @@ Checks:
 - PFCP response cause other than accepted.
 - Request without response.
 - Retransmissions and timeout.
+- PFCP Association Setup, Update and Release rejection, timeout, restart or
+  recovery discontinuity as node-pair observations.
+- PFCP Session Report Error Indication and user-plane path failure when
+  reported SEID/F-TEID maps to the attempt; other report types remain
+  observations unless profile/cause policy proves failure relevance.
 - SEID mismatch or unknown session.
 - Failed PDR/FAR/QER/URR creation or update.
-- Missing F-TEID, invalid tunnel values, or inconsistent QFI/UE address.
+- Missing F-TEID, invalid tunnel values, or inconsistent QFI/UE address using
+  procedure/profile-aware directional roles rather than one static tunnel
+  direction rule.
 - Session modification or deletion anomalies.
 
 ### T09: `detect_missing_transitions`
@@ -743,6 +754,10 @@ Required behavior:
 
 - Track state changes by NF instance and service, not only NF type.
 - Build an NF readiness snapshot at the start of the selected UE attempt.
+- Represent readiness as one or more `ServiceRequirement` rows
+  (service/version/endpoint/stage) and aggregate across eligible NF instances.
+  Missing or partial NRF observations must remain attached to the affected
+  requirement rather than being flattened into a single NF-type state.
 - Recognize idempotent startup cleanup patterns.
 - Example: pre-call `DELETE /nf-instances/<id>` returning `404`, followed by successful registration of the same instance before the first UE request, is `benign_startup_cleanup`.
 - Mark repeated deregistration/cleanup errors as background warnings when followed by healthy registration.
@@ -838,7 +853,12 @@ Outputs:
 
 ## 8. Scenario and Procedure-State Requirements
 
-V2 must use a scenario-profile registry rather than one universal call flow. A profile defines the initiating event, expected stages, optional branches, correlation fields, success terminals, failure terminals, timeout rules and capture-visibility requirements.
+V2 must use a scenario-profile registry rather than one universal call flow. A
+profile defines the initiating event, expected stages, optional branches,
+correlation fields, success terminals, failure terminals, timeout rules and
+capture-visibility requirements. Visibility requirements distinguish
+architecture reference points from SBI service/API visibility and are resolved
+through the selected 3GPP release/deployment profile.
 
 Every stage must have one applicability classification:
 
@@ -1019,6 +1039,14 @@ DOWNLINK_TRIGGER
 ```
 
 The harness must correlate repeated paging, paging timeout, UE non-response and successful paging on one access while another access remains idle.
+
+Reachability-loss and mobile-terminated delivery failures are owned by the
+service/paging profiles plus T07/T08/T09 evidence: paging/request absence is a
+T09 missing-transition candidate only when the relevant visibility and timeout
+are satisfied; explicit NGAP access failures are T07 candidates; mapped PFCP
+Session Report path failures are T08 candidates; successful delivery or
+invisible paging/access/user-plane stages remain observations or
+`inconclusive`.
 
 ### 8.4 PDU session lifecycle family
 
@@ -1285,11 +1313,33 @@ When multiple profiles remain possible, the report must show alternatives, for e
 - Periodic registration versus mobility registration when registration type is unavailable.
 - Home-routed versus local-breakout roaming when only the visited side is visible.
 
+Alternative procedure profiles must be persisted with profile ID, confidence,
+score terms, evidence, and selected/rejected/disambiguated status. Reports
+must render them separately from root-cause alternatives.
+
 ### 8.12 Configurability and standards references
 
-Procedure definitions must be data-driven and versioned by 3GPP release/deployment profile. Primary reference families are TS 23.502 for system procedures, TS 24.501 for NAS, TS 38.413 for NGAP and the applicable 29-series SBI/PFCP specifications.
+Procedure definitions must be data-driven and versioned by 3GPP
+release/deployment profile. Primary reference families are TS 23.502 for
+system procedures, TS 24.501 for NAS, TS 38.413 for NGAP and the applicable
+29-series SBI/PFCP specifications.
+
+The selected release/deployment profile must also provide the visibility
+registry used by T04/T09/T14. Reference-point visibility is separate from
+SBI service/API visibility: `Nnrf` is an SBI service key, not a reference
+point, while NRF-to-NRF roaming visibility uses `N27`. The registry must
+include release-applicable definitions for `N7`, `N13`, `N35`, `N36` and
+`N37` so policy, authentication and UDR-backed flows can be visibility-gated
+without changing detector code.
 
 Vendor-specific ordering, optional NF calls and capture-point visibility must be configurable without changing the attempt engine.
+
+Every attempt must publish an observability timing checklist covering trigger,
+first UE/network request, first primary SBI, first PFCP session/association
+operation, first access resource action, missing-stage deadline, terminal
+outcome, phase window and dependency recovery/unresolved timing when
+applicable. Each timing records source anchor, frame-first precision,
+observed/absent/not-applicable/inconclusive semantics and evidence references.
 
 ## 9. Multiple Attempt Behavior
 
@@ -1408,7 +1458,7 @@ V2.1 is accepted when it can:
 15. Distinguish Xn, N2 and inter-AMF handover and classify successful rollback separately from failed mobility.
 16. Correlate path-switch NGAP, SBI and PFCP tunnel updates and identify the first failed domain.
 17. Classify home, visited, home-routed and local-breakout roaming sufficiently to avoid applying the wrong expected stages.
-18. Return `inconclusive`, rather than a false failure, when a mandatory stage belongs to an interface that was not visible in the capture.
+18. Return `inconclusive`, rather than a false failure, when a mandatory stage belongs to a reference point, SBI service or SBI API that was not visible in the capture.
 19. Retrieve the complete original decoded record for any report evidence or failure candidate.
 20. Retrieve configurable pre/post packet context around an issue without loading the complete capture into model context.
 21. Perform a bounded targeted re-decode from the retained PCAP when a required field was not present in the initial decoder output.
