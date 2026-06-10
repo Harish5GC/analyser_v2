@@ -38,7 +38,7 @@ class ClassifyCapturePhasesRequest(BaseModel):
 
 
 class CapturePhaseConfig(BaseModel):
-    policy_version: str
+    phase_policy: ResolvedPolicy
     default_pre_roll_frames: int = 20
     default_post_roll_frames: int = 20
     default_pre_roll_seconds: Decimal | None = None
@@ -203,7 +203,7 @@ Frame-phase index supports logarithmic interval lookup.
 Revision hash includes capture bounds, attempts revision, profile/phase policy, and roll configuration. Same inputs produce identical interval IDs:
 
 ```text
-UUIDv5(analysis_id + phase + bounds + sorted attempt IDs + policy_version)
+UUIDv5(analysis_id + phase + bounds + sorted attempt IDs + phase_policy.sha256)
 ```
 
 Changed attempt boundaries/policy create a new immutable revision.

@@ -64,6 +64,7 @@ class InspectNRFFlowRequest(BaseModel):
     nf_instance_id: str | None = None
     fqdn: str | None = None
     consumer_nf: str | None = None
+    expansion_budget: ExpansionBudget
 
 
 class NRFInspectionResult(BaseModel):
@@ -74,6 +75,7 @@ class NRFInspectionResult(BaseModel):
     attempt_id: UUID
     status: Literal["completed", "empty", "partial", "failed"]
     effective_window: FrameWindow
+    expansion_decisions: list[ExpansionDecision]
     selected_entities: list[NFEntityRef]
     transactions: list[NRFTransactionEvidence]
     lifecycle: BuildNFLifecycleResult | None
@@ -247,13 +249,50 @@ Fault domain remains inconclusive when only consumer-SCP boundary is captured.
 
 ## 15. Bounded Expansion
 
-One expansion maximum. Allowed only when first result proves:
+T24 owns one shared expansion ledger per approved request:
+
+```python
+class ExpansionBudget(BaseModel):
+    request_id: UUID
+    maximum_expansions: Literal[1] = 1
+    expansions_consumed: int = 0
+    original_window: FrameWindow
+    maximum_window: FrameWindow
+
+class ExpansionDecision(BaseModel):
+    decision_id: UUID
+    source: Literal["T22", "T24"]
+    reason_code: Literal[
+        "LIFECYCLE_PREDECESSOR_OUTSIDE_WINDOW",
+        "FAILURE_RECOVERY_PAIR_CROSSES_EDGE",
+        "DISCOVERY_PAIR_CROSSES_EDGE",
+        "STATUS_NOTIFICATION_OUTSIDE_EDGE",
+    ]
+    requested_window: FrameWindow
+    original_window: FrameWindow
+    effective_window: FrameWindow
+    counter_before: int
+    counter_after: int
+    decision: Literal["approved", "clamped", "denied_budget", "denied_scope", "denied_no_evidence"]
+    evidence_ids: list[UUID]
+```
+
+T22 and T24 submit proposals to the same T24 validator. T22 has no independent
+extension allowance and cannot mutate bounds. The first approved or clamped
+proposal atomically consumes the single counter; every later proposal is
+`denied_budget` even when it has a different source.
+
+An expansion is allowed only when the current result proves:
 
 - Registration/recovery pair crosses window edge.
 - Discovery request/response pair crosses edge.
 - Referenced status notification immediately outside edge.
 
-Expansion request is generated deterministically, revalidated, clamped, and audited. It cannot expand to complete capture. No second expansion.
+Every proposal and denial is generated deterministically, revalidated,
+clamped, persisted in request-validation/manifest artifacts and included in
+the T24 revision. It records source, reason, original/requested/effective
+bounds, counter before/after, validator decision and evidence. It cannot
+expand to the complete capture. No second expansion exists.
 
 ## 16. Background Impact
 
@@ -290,7 +329,9 @@ Before T15/provider boundary:
 
 ## 19. Deterministic Revision and Persistence
 
-Revision includes initial packet/request, validated/effective bounds, selector/capability, NRF source/index revisions, T21 phase, T22/T23 policy, and tool version.
+Revision includes initial packet/request, original/validated/effective bounds,
+the complete expansion ledger/decisions, selector/capability, NRF source/index
+revisions, T21 phase, T22/T23 policy, and tool version.
 
 ```text
 evidence/dependency/<request-id>/nrf/
@@ -392,6 +433,9 @@ V2/harness/storage/
 - Delegated discovery success/failure/partial visibility.
 - Multiple matching instances and ambiguity.
 - One justified expansion.
+- T22 proposal consumes the shared counter and prevents a later T24 expansion.
+- T24 expansion consumes the shared counter and denies a later T22 proposal.
+- Denied/clamped proposals persist reason, all bounds and counter state.
 
 ### 26.3 Safety/integration tests
 

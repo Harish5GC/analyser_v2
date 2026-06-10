@@ -37,7 +37,7 @@ class AssessBackgroundImpactRequest(BaseModel):
     dependency_events: list[DependencyEventSummary]
     lifecycle: BuildNFLifecycleResult | None
     dependency_comparison: DependencyBaselineComparison | None
-    policy_version: str
+    impact_policy: ResolvedPolicy
 
 
 class AssessBackgroundImpactResult(BaseModel):
@@ -54,6 +54,8 @@ class AssessBackgroundImpactResult(BaseModel):
     demotion_conditions: list[str]
     contradictions: list[str]
     missing_evidence: list[str]
+    counterfactual_supported: bool | None
+    decision_trace: list[ImpactDecisionStep]
     confidence: Literal["high", "medium", "low", "inconclusive"]
 ```
 
@@ -117,6 +119,55 @@ Evidence demonstrates recovery, different entity/resource, successful bypass/alt
 
 Evidence is insufficient/conflicting: missing selection mapping, incomplete capture, ambiguous identity, no visible causal bridge.
 
+### 8.1 Executable decision table
+
+T23 executes the following gates in order. Later rows cannot override an
+earlier terminal result except where the row explicitly says to continue.
+
+| Order | Gate | Deterministic rule | Outcome/action |
+|---:|---|---|---|
+| 1 | Input eligibility | Approved request/attempt/initial symptom lineage and at least one dependency event are valid | Invalid lineage fails inspection; no event produces `inconclusive` or `unrelated` only when positive non-use/recovery evidence exists |
+| 2 | Requirement mapping | Map the attempt stage to exact dependency instance/service/resource/context/operation | No supported mapping -> `inconclusive`; explicit different/unused mapping -> `unrelated` |
+| 3 | Causal-link construction | Build strong/supporting/contradictory links from hidden anomaly through selection/propagation to visible symptom and failed stage | No strong promotion link means `unrelated` when a strong demotion exists, otherwise `inconclusive` |
+| 4 | Temporal reachability | Cause is unresolved before the symptom/stage; post-terminal cleanup is excluded | Impossible ordering -> `unrelated`; unknown ordering -> `inconclusive`; otherwise continue |
+| 5 | Recovery/bypass | Evaluate recovery before required stage, healthy alternate selection, retry success and attempt success | Proven recovery/bypass/success -> `unrelated`; partial/late recovery is recorded and continues |
+| 6 | Hard contradictions | Evaluate section 13 after links and temporal facts exist | Contradiction disproving same dependency -> `unrelated`; unresolved hard contradiction -> `inconclusive`; no hard contradiction -> continue |
+| 7 | Earliest-cause ordering | Compare dependency anomaly with other independently supported attempt causes and first divergence | Earlier independent cause present -> dependency cannot be `causal`; continue as possible `contributing` |
+| 8 | Counterfactual | Ask only from evidence: if this dependency anomaly were absent, do healthy alternate/baseline/profile facts show the attempt could reach the failed stage? | Supported and dependency is earliest complete causal path -> `causal`; false/contradicted -> not causal; unknown -> possible `contributing`/`inconclusive` |
+| 9 | Final classification | Apply the rules below | Exactly one terminal impact and confidence are emitted |
+
+Final classification precedence:
+
+1. `unrelated` for proved non-use, different context, pre-stage recovery,
+   successful bypass/alternate, successful attempt, or impossible timing.
+2. `inconclusive` for missing requirement mapping/causal bridge, ambiguous
+   identity, unknown temporal order, incomplete visibility or unresolved hard
+   contradiction.
+3. `causal` only when there is a complete strong path, valid ordering, no hard
+   contradiction, the dependency is the earliest supported cause, and the
+   evidence-backed counterfactual is true.
+4. `contributing` when a complete/strong impact path exists and the anomaly
+   materially worsened or blocked progression, but another earlier/independent
+   cause exists, exclusivity/counterfactual is not proved, or recovery occurred
+   only after material delay/failure.
+
+Section 6 conditions gate eligibility only. No single promotion condition is
+sufficient for `causal`; causal requires sections 9-13 plus the ordered table.
+
+```python
+class ImpactDecisionStep(BaseModel):
+    order: int
+    gate: str
+    result: Literal["pass", "fail", "unknown", "not_applicable"]
+    reason_codes: list[str]
+    evidence_ids: list[UUID]
+    terminal_impact: Literal["causal", "contributing", "unrelated", "inconclusive"] | None
+```
+
+Every gate appends one trace row. Policy tables define reason-code membership,
+not execution order. The trace and input revisions make classification
+replayable without model interpretation.
+
 ## 9. Causal Link Model
 
 ```python
@@ -176,6 +227,11 @@ Examples:
 - Attempt succeeds but hidden error exists.
 
 Hard contradiction prevents `causal`; result becomes unrelated/inconclusive depending evidence. Preserve all contradiction evidence.
+
+A contradiction is evaluated after temporal and selection links are built.
+It cannot be used as a generic score penalty. Contradictions proving a
+different entity/context or successful bypass are `unrelated`; contradictions
+caused by incomplete/ambiguous evidence are `inconclusive`.
 
 ## 14. Confidence Rules
 
@@ -275,6 +331,10 @@ V2/harness/models/
 ### 24.1 Unit tests
 
 - Every promotion/demotion condition.
+- Every decision-table row and terminal short-circuit.
+- Causal requires complete path, earliest-cause ordering, true counterfactual
+  and no hard contradiction.
+- Contributing with earlier independent cause or unknown exclusivity.
 - Temporal ordering and recovery before/after call.
 - Exact versus supporting entity/context links.
 - Causal/contributing/unrelated/inconclusive semantics.

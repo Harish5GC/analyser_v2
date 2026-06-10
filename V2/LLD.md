@@ -241,6 +241,14 @@ class HarnessConfig(BaseModel):
     temperature: float = 0.1
     max_model_input_tokens: int = 12000
     max_model_output_tokens: int = 2000
+    model_input_target_min_tokens: int = 2000
+    model_input_target_max_tokens: int = 8000
+    model_token_safety_margin: int = 256
+    model_profile_version: str | None = None
+    token_counter_profile: str = "utf8_bytes_v1"
+    max_total_model_calls_per_pass: int = 3
+    max_transport_retries_per_pass: int = 1
+    max_content_recovery_calls_per_pass: int = 1
     dependency_lookup_mode: Literal["model_requested"] = "model_requested"
     max_dependency_requests_per_attempt: int = 2
     dependency_context_frames_before: int = 100
@@ -918,6 +926,21 @@ Registration attempts share a parent definition but have distinct stage sets:
 - Emergency: emergency policy and limited-service variants apply.
 - Non-3GPP: access-specific context and identifiers remain separate from 3GPP access.
 
+T03 represents 3GPP, untrusted N3IWF and trusted TNGF access as distinct
+time-bounded access-context nodes and registration states under a shared UE.
+T04 keys attempts/state by access context and never merges concurrent access
+registrations. Explicit access mobility creates evidence-backed relations
+between source/target attempts while preserving both histories. The normative
+profile anchors and fixtures are in `profiles/README.md` section 5.2.
+
+For initial, mobility and periodic profiles, `REGISTRATION_COMPLETE` is a
+conditional acknowledgement stage. The selected release/deployment overlay
+evaluates `attempt.registration_accept_requires_ack`, derived from the decoded
+Registration Accept and its acknowledgement-triggering information elements.
+`true` makes the stage mandatory, `false` makes it not applicable, and
+`unknown` makes absence inconclusive. Observing Registration Complete in other
+attempts is not an applicability rule.
+
 The start matcher must read the NAS registration type. If unavailable, the profile is `REGISTRATION_UNKNOWN` and the report lists candidate variants.
 
 ### 10.6 Emergency profiles
@@ -953,7 +976,19 @@ class RoamingContext(BaseModel):
     visited_nf_domains: set[str]
     home_nf_domains: set[str]
     evidence_ids: list[UUID]
+    alternatives: list[TopologyAlternative]
+    confidence: Literal["high", "medium", "low", "inconclusive"]
+    fault_domains: FaultDomainMap
+    topology_revision: str
 ```
+
+T03 owns this classification and publishes time-bounded
+`RoamingTopologyInterval` records plus independent `FaultDomainMap` records.
+T04 attaches the applicable interval to each attempt. T11 uses topology only
+for baseline compatibility; T12 classifies each candidate's actual domain
+against the map; T14 evaluates scenario topology conditions; T17 renders the
+selected topology, alternatives/confidence/evidence and candidate fault domain
+as separate concepts.
 
 Home-routed profiles expect V-SMF/H-SMF and home/visited path stages only when visible. Local-breakout profiles must not flag absent H-SMF or N9 activity. Failure candidates are assigned a fault domain: `UE`, `RAN`, `VISITED_CORE`, `HOME_CORE`, `INTER_PLMN`, `UPF_PATH` or `UNKNOWN`.
 
@@ -1246,9 +1281,13 @@ OpenAI(
 )
 ```
 
-The gateway first requests JSON-schema response format when supported. If rejected by the endpoint, it falls back to JSON-only prompting and local Pydantic validation.
-
-One repair retry is allowed with only the validation errors and previous response. No protocol evidence is expanded during repair.
+The gateway uses the persisted per-pass call ledger defined by T16 section
+12.1. Every actual provider invocation consumes the shared total cap. One
+transport retry is shared across the pass, and at most one content-recovery
+call is permitted: structured-output fallback or schema repair, never both.
+The default maximum is three calls per pass. Call reservation and each outcome
+are persisted before another invocation; cancellation/restart cannot reset the
+counter. No protocol evidence is expanded during fallback or repair.
 
 ## 17. Model Diagnosis Contract
 
@@ -1589,13 +1628,15 @@ def analyze(request: AnalysisRequest) -> AnalysisReport:
                     comparison=comparisons[attempt_id],
                     root=primary_roots[attempt_id],
                     scenario=scenario_primary,
+                    token_budget=model_runtime.budget_for("initial"),
                 ),
             )
             initial_diagnoses[attempt_id] = execute_and_publish(
                 manifest,
                 "T16:initial",
                 lambda: diagnosis_generator.generate_initial(
-                    initial_packets[attempt_id]
+                    initial_packets[attempt_id],
+                    provider_config=model_runtime.provider_config,
                 ),
             )
             dependency_outcomes_by_attempt[attempt_id] = (
@@ -1663,12 +1704,16 @@ def analyze(request: AnalysisRequest) -> AnalysisReport:
                     dependency_results,
                     expanded_roots[attempt_id],
                     scenario_expanded,
+                    token_budget=model_runtime.budget_for("final"),
                 ),
             )
             diagnoses[attempt_id] = execute_and_publish(
                 manifest,
                 "T16:final",
-                lambda: diagnosis_generator.generate_final(final_packet),
+                lambda: diagnosis_generator.generate_final(
+                    final_packet,
+                    provider_config=model_runtime.provider_config,
+                ),
             )
 
     analysis_state = manifest.build_analysis_state(
@@ -1866,15 +1911,19 @@ packages.
 |---|---|---|
 | `SourceRef`, `CanonicalEvent`, `EventIdentifiers` | `models/events.py` | Section 4.1-4.3 |
 | `IdentityEdge`, `UEContext`, `IdentityLinkThresholds` | `models/identity.py` | Section 4.4 |
+| `AccessContextKey`, `AccessRegistrationState` | `models/identity.py` | T03 sections 6.2 and 6.5 |
+| `RoamingTopologyInterval`, `TopologyAlternative`, `TopologyEvidenceTerm`, `FaultDomainMap` | `models/topology.py` | T03 section 4.1; section 10.8 |
 | `ProcedureAttempt`, `StateTransition`, `RetryRecord`, `InterfaceVisibility` | `models/attempts.py` | Sections 4.5, 23.1 |
 | `FailureCandidate`, `ScoreTerm`, `TerminalEffect` | `models/failures.py` | Sections 4.6, 12; T07 section 10 |
 | `EvidenceRecord`, `EvidenceCapability`, cursor envelope | `models/evidence.py` | Sections 24, 30 (in tools/T18 until section 30 lands) |
 | `EvidenceStage`, `ModelPass` | `models/common.py` | Section 4.10 |
+| `TokenCounterSpec`, `ResolvedTokenBudget`, `ResolvedModelRuntime` | `models/token_budget.py` | Section 29.1; T15 section 4 |
 | `ArtifactDescriptor`, `CollectionDescriptor` | `models/common.py` | Section 23.2 |
 | `CaptureMetadata`, `FrameWindow`, `PhaseRoll`, `CapturePhaseInterval`, `CapturePhaseLabel` | `models/phases.py` | Section 23.1; T21 sections 5, 12 |
 | `EventMatcher`, `ConditionExpression`, profile models | `models/profiles.py` | Section 23.3; `profiles/README.md` |
 | `DetectionContext`, `ResolvedPolicySet` | `models/detection.py` | Sections 11, 29 |
 | `DependencyEvidenceRequest`, `DependencyReasonCode`, `DependencyInspectionResult` | `models/tool_requests.py` | Section 17 |
+| `ExpansionBudget`, `ExpansionDecision` | `models/tool_requests.py` | T24 section 15 |
 | `DependencyEventSummary`, `DependencyBaselineComparison`, `UDRBaselineComparison` | `models/dependency.py` | Section 23.4 |
 | `NFEntityReadiness`, `ServiceRequirement` | `models/dependency.py` | Section 23.4; T22 section 15 |
 | Scenario models | `models/scenario.py` | Section 14 pointers |
@@ -2181,7 +2230,8 @@ class Issue(BaseModel):
 
 - Codes are uppercase snake case, namespaced by owning stage/tool prefix:
   `T02_VALUE_PARSE_FAILED`, `T02_AMBIGUOUS_DEPENDENCY_PARTITION`,
-  `T15_EVIDENCE_BUDGET_EXCEEDED`, `RUN_EVIDENCE_INTEGRITY`,
+  `T15_TOKEN_BUDGET_BELOW_TARGET`, `T15_EVIDENCE_BUDGET_EXCEEDED`,
+  `RUN_EVIDENCE_INTEGRITY`,
   `RUN_ACCESS_BOUNDARY`. Cross-tool recurring conditions own `RUN_`-prefixed
   codes so "evidence-integrity" and "access-boundary" are single codes
   everywhere.
@@ -2296,17 +2346,87 @@ are resolved once at run startup into immutable handles:
 class ResolvedPolicy(BaseModel):
     name: str
     version: str
+    schema_version: str
     sha256: str
+    compatibility: list[str]
     payload: JsonValue
 
 class ResolvedPolicySet(BaseModel):
     policies: dict[str, ResolvedPolicy]
+    revision: str
+
+class ResolvedProfileRegistry(BaseModel):
+    registry_version: str
+    schema_version: str
+    sha256: str
+    supported_releases: list[str]
+    supported_deployments: list[str]
+    registry: ProfileRegistry
 ```
 
-- Resolution validates each policy file against its schema, records its
-  checksum, and fails the run (`exit 2`) for a missing, schema-invalid or
-  checksum-mismatched version. There is no lazy mid-run policy loading.
+- Resolution maps an explicit configured name/version to exactly one file
+  under an allowlisted `harness/config/<kind>/` registry. It canonicalizes and
+  checksums bytes, validates schema/version and declared tool compatibility,
+  validates referenced child files, and rejects path traversal, duplicate
+  names/versions or ambiguous aliases.
+- Missing version, unreadable file, checksum mismatch, schema failure,
+  incompatible tool/schema version, invalid cross-reference or corrupt child
+  is a fatal startup configuration issue (`exit 2`). There is no fallback to
+  latest/default after an explicit version and no lazy mid-run policy loading.
 - Tools receive `ResolvedPolicy` handles via `DetectionContext.policies` or
   their request models; they never load files from bare version strings.
+- T04 receives `ResolvedProfileRegistry`; T11/T12/T13/T14/T21/T22/T23 receive
+  purpose-specific `ResolvedPolicy` handles. T06-T09 read their exact handles
+  from `DetectionContext.policies`. Payloads are immutable/read-only and
+  cannot be refreshed during a run.
 - The resolved set's name/version/checksum triples enter every revision
   envelope (`policy_versions`), making policy drift visible in lineage.
+- `ResolvedPolicySet.revision` is the canonical digest of sorted
+  name/version/schema/checksum/compatibility entries and is stored in the run
+  manifest before T01 starts. Startup logs record identities only, never
+  sensitive payload values.
+
+### 29.1 Model limits and token-counter resolution
+
+At startup the resolver combines `HarnessConfig`, the selected
+provider/model profile, versioned prompts/schemas and a token-counter profile:
+
+```python
+class ResolvedModelRuntime(BaseModel):
+    provider_config: ProviderConfig
+    initial_budget: ResolvedTokenBudget
+    final_budget: ResolvedTokenBudget
+    model_profile_name: str
+    model_profile_version: str
+    model_profile_checksum: str
+    prompt_revisions: dict[ModelPass, str]
+
+    def budget_for(self, model_pass: ModelPass) -> ResolvedTokenBudget: ...
+```
+
+Resolution rules:
+
+1. Resolve the provider/model context window, framing profile and maximum
+   output from a schema-validated, checksummed model profile. Configuration may
+   lower a limit but cannot raise the provider profile.
+2. Resolve exactly one `TokenCounterSpec`. A pinned tokenizer requires exact
+   tokenizer ID/version and vocabulary checksum. Missing/mismatched artifacts
+   fail startup; the resolver never silently switches to fallback.
+3. The deterministic fallback `utf8_bytes_v1` counts one token per byte of
+   canonical UTF-8 JSON and is allowed only for model profiles whose
+   conformance corpus proves it does not undercount.
+4. Count each pass's exact versioned system prompt and response schema with the
+   selected counter; add the profile's fixed provider-framing reserve.
+5. Compute `effective_input_tokens` as the minimum of remaining context,
+   `max_model_input_tokens` and the packet hard cap. Compute the soft target as
+   the minimum of that value and `model_input_target_max_tokens`.
+6. Validate positive limits and `target_min <= target_max <= hard_cap`.
+   Non-positive remaining context or incompatible limits fail configuration.
+7. Persist profile/counter/prompt identities and both resolved budgets in the
+   run manifest. They enter T15 packet IDs and all T15/T16 revisions.
+
+T15 receives the pass-specific budget directly; no tool recomputes it from
+loose integers. T16 receives the matching provider config and rejects any
+packet whose counter, budget, prompt revision or measured count differs. Token
+usage reported by local/OpenRouter providers is retained separately for
+observability and never changes deterministic trimming.

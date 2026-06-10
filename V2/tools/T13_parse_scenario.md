@@ -34,7 +34,7 @@ class ParseScenarioRequest(BaseModel):
     scenario_text: str | None
     explicit_selectors: ScenarioSelectors | None
     provider_mode: Literal["none", "local", "openrouter"]
-    parser_policy_version: str
+    parser_policy: ResolvedPolicy
 
 
 class ParseScenarioResult(BaseModel):
@@ -262,7 +262,7 @@ T13 parses selector representation only. T14 resolves it against local indexes.
 ## 14. Deterministic Scenario ID
 
 ```text
-UUIDv5(analysis_id + normalized_text_hash + explicit_selector_hash + parser_policy_version)
+UUIDv5(analysis_id + normalized_text_hash + explicit_selector_hash + parser_policy.sha256)
 ```
 
 Original text is preserved locally. Reports may include it only after configured masking.

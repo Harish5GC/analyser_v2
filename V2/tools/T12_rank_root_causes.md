@@ -29,6 +29,11 @@ T12 must not:
 
 T12 receives immutable candidate/result objects only. It cannot instantiate protocol readers.
 
+For roaming attempts, T12 receives the T03 `FaultDomainMap` attached through
+T04 and assigns each ranked candidate's domain from its cited endpoint/NF/path
+evidence. Unknown or conflicting mapping remains `UNKNOWN`; topology alone
+cannot force `HOME_CORE` or `VISITED_CORE`.
+
 ## 4. Python Tool Contract
 
 ```python
@@ -42,7 +47,7 @@ class RankRootCausesRequest(BaseModel):
     dependency_results: list[DependencyInspectionResult] = Field(default_factory=list)
     pass_stage: EvidenceStage
     primary_ranking_revision: str | None = None
-    ranking_policy_version: str
+    ranking_policy: ResolvedPolicy
 
 
 class RootCauseResult(BaseModel):

@@ -373,13 +373,20 @@ The gateway supports:
 - `local`: OpenAI-compatible local endpoint.
 - `openrouter`: OpenRouter endpoint and API key.
 
+At startup the central resolver produces one checksummed provider/model
+runtime profile with context/input/output limits, initial/final prompt
+revisions and a pinned token counter. T15 and T16 consume the same resolved
+budgets; neither probes or switches tokenizers during a run.
+
 The gateway handles:
 
-- Context/token budget enforcement.
+- Deterministic packet and exact pre-send context/token budget enforcement.
 - Structured diagnosis and dependency-evidence request output.
 - Validation of tool name, attempt ID, target selectors, reason code and bounded window.
 - A maximum of one dependency-evidence round before the final diagnosis.
 - Timeout and one retry for malformed output.
+- A persisted per-pass call ledger with a default three-call ceiling, one
+  shared transport retry and one mutually exclusive fallback-or-repair slot.
 - Schema validation.
 - Provider metadata and usage reporting.
 - Privacy masking before remote calls.

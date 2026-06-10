@@ -32,7 +32,7 @@ class CompareAttemptsRequest(BaseModel):
     analysis_id: UUID
     failed_attempt_id: UUID
     max_baselines: int = 2
-    policy_version: str
+    comparison_policy: ResolvedPolicy
 
 
 class CompareAttemptsResult(BaseModel):
@@ -57,6 +57,8 @@ A baseline must:
 - Have sufficient interface visibility for compared stages.
 - Match emergency/non-emergency and relevant access context.
 - Match roaming topology/fault-domain expectations where applicable.
+- Consume the persisted T03 topology interval/revision; do not independently
+  infer roaming from request strings or candidate fault domain.
 
 Candidate is excluded when identity correlation is unresolved or profile differs materially.
 

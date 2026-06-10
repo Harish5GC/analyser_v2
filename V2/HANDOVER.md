@@ -16,12 +16,8 @@ it). Backlog items are V2-001..V2-062 in priority groups P0-P4.
   added the LLD/tools index pointers, replaced T14's duplicate stage literals
   with shared `EvidenceStage`, updated `reviews/TODO.md`, and synchronized the
   root `TODO.md`.
-- **P1 (V2-018..034)** — V2-018 is complete. `LLD.md` §29
-  (Configuration and Policy Resolver) was written early because P0's
-  `DetectionContext` depends on it. That covers the LLD half of **V2-021**;
-  residual work: reference the resolver from T11/T12/T21 (replace their bare
-  `policy_version` strings the way T06-T09 now do) and add a reliability
-  bullet to `requirement.md` §11.
+- **P1 (V2-018..034)** — V2-018 through V2-026 are complete. The next item is
+  **V2-027** (release/profile-aware reference-point and SBI visibility).
 - **P2/P3/P4** — not started. Note: several P3 items are already partially
   satisfied by P0 side effects (see §5).
 
@@ -155,7 +151,40 @@ it). Backlog items are V2-001..V2-062 in priority groups P0-P4.
      authored profiles explicitly so V2-054's completeness CI can key off it.
 2. Added the two pointers: `LLD.md` section 10 and `tools/README.md`.
 3. Marked V2-003..V2-017 and V2-061 complete in `reviews/TODO.md`; V2-021
-   remains open. Synchronized root `TODO.md` from the authoritative copy.
+   was completed later in P1. Synchronized root `TODO.md` from the
+   authoritative copy.
+
+## 3.1 P1 work completed before this handover
+
+- **V2-018:** T20 now separates result, decoder and source-scan bounds; uses
+  indexed or honestly accounted scan-preslice access; preserves HTTP2/HPACK,
+  SCTP/NGAP and fragment context; maps slice frames to source; and records
+  cleanup/provenance. T01 defines the optional packet-access index.
+- **V2-019:** T15/T16 share a resolved token budget with pinned exact/fallback
+  counting, explicit reserves/precedence, mandatory-first below-target
+  behavior, pre-send recounting and deterministic revision inputs.
+- **V2-020:** T16 owns a crash-safe per-pass call ledger: maximum three calls,
+  one shared transport retry, and one mutually exclusive fallback-or-repair
+  call with every outcome/terminal reason persisted.
+- **V2-021:** Section 29 now resolves profiles, policies, dictionaries and
+  model/tokenizer profiles at startup into immutable schema/checksum-validated
+  handles. Bare policy-version request fields were removed from T04,
+  T11-T14 and T21-T23.
+- **V2-022:** T22/T24 share one T24-owned expansion counter and persist every
+  proposal, clamp, denial, reason and original/requested/effective bound.
+- **V2-023:** T23 has an executable ordered decision table for eligibility,
+  links, temporal reachability, recovery, contradictions, earliest cause,
+  counterfactual and terminal impact classification.
+- **V2-024:** Registration Complete is conditional on a release/profile rule
+  derived from Registration Accept; true/false/unknown behavior and fixtures
+  are defined.
+- **V2-025:** T03 produces time-bounded roaming topology alternatives and
+  independent fault-domain maps for T04/T11/T12/T14/T17.
+- **V2-026:** T03/T04/profile contracts now define separate gNB, N3IWF and
+  TNGF access contexts, access-scoped registration state, concurrent-access
+  non-merge rules, mobility relations and scoped deregistration.
+
+Stop point requested by the user: do not begin V2-027 in this handover batch.
 
 ## 4. Key decisions already made (do not re-litigate)
 
@@ -195,5 +224,6 @@ it). Backlog items are V2-001..V2-062 in priority groups P0-P4.
 
 ## 6. Session task list state
 
-Task #1 (P0) complete. P1 is in progress with V2-018 complete; V2-019 is the
-next open item. Tasks P2-P4 remain pending. TODO synchronization is current.
+Task #1 (P0) complete. P1 is in progress with V2-018 through V2-026 complete;
+V2-027 is the next open item. P2-P4 remain pending. TODO synchronization is
+current.

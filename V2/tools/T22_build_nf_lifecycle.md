@@ -34,7 +34,8 @@ class BuildNFLifecycleRequest(BaseModel):
     frame_end: int
     attempt_start_frame: int
     selectors: NRFSelectors
-    policy_version: str
+    lifecycle_policy: ResolvedPolicy
+    expansion_budget: ExpansionBudget
 
 
 class BuildNFLifecycleResult(BaseModel):
@@ -237,13 +238,20 @@ Use only events at or before attempt start. Later recovery is reported separatel
 
 ## 16. Window and Pre-Call Expansion
 
-T24 supplies approved window. T22 may request one bounded earlier extension only when:
+T24 supplies the approved window and shared `ExpansionBudget`. T22 may submit
+one bounded earlier-extension proposal to the T24 validator only when:
 
 - Selected instance registration starts before current window.
 - A failure/recovery pair crosses the start boundary.
-- T24 validator approves the expanded lower bound.
+- T24 validator approves or clamps the expanded lower bound and atomically
+  consumes the request's single expansion counter.
 
-No automatic capture-wide scan. Expansion reason and effective bounds are persisted.
+T22 cannot read expanded data until it receives the persisted
+`ExpansionDecision`. A T22 approval consumes the same counter used by T24
+section 15; there is no second T22 budget. Denied proposals leave the original
+window unchanged. No automatic capture-wide scan. Source, reason,
+original/requested/effective bounds, counter state and decision are persisted
+under the parent T24 request.
 
 ## 17. Ambiguity Handling
 
@@ -353,7 +361,9 @@ V2/harness/storage/
 - Empty discovery despite registered profile.
 - Delegated discovery and endpoint selection.
 - Capture starts after registration.
-- Bounded earlier expansion.
+- Shared-budget earlier expansion approval, clamping and denial.
+- T22-first approval prevents T24 expansion; T24-first approval prevents T22
+  extension.
 
 ### 26.3 Negative tests
 

@@ -170,6 +170,7 @@ vocabulary. Adding a fact requires a schema-versioned registry change.
 |---|---|---|
 | `request.registration_type` | `initial`, `mobility_update`, `periodic_update`, `emergency`, `unknown` | T05/T04 request signature |
 | `request.access_type` | `3gpp`, `non_3gpp_trusted`, `non_3gpp_untrusted`, `unknown` | T05/T04 |
+| `request.access_anchor_type` | `GNB`, `N3IWF`, `TNGF`, `UNKNOWN` | T03/T04 |
 | `request.emergency` | boolean | T05/T04 |
 | `request.service_request_type` | normalized NAS service-request type or `unknown` | T05 |
 | `request.dnn` | normalized/masked string or absent | T05 |
@@ -184,6 +185,7 @@ vocabulary. Adding a fact requires a schema-versioned registry change.
 | `attempt.roaming_topology` | `home`, `visited_unknown`, `home_routed`, `local_breakout`, `inconclusive` | topology producer |
 | `attempt.rollback_observed` | boolean or unknown | T04 |
 | `attempt.source_context_available` | boolean or unknown | T04/identity graph |
+| `attempt.registration_accept_requires_ack` | boolean or unknown, derived by the selected release rule from the decoded Registration Accept | T02/T04 profile projection |
 | `visibility.<reference_point>` | `observed`, `not_observed`, `unknown` | `DetectionContext.visibility` |
 | `visibility.service.<service_name>` | `observed`, `not_observed`, `unknown` | release/profile visibility registry |
 | `profile.release` | resolved release identifier | profile resolver |
@@ -217,6 +219,67 @@ all events are strictly serial. Causal ordering is defined by
 Profile validation rejects cycles, dangling predecessors, unreachable
 mandatory stages, terminals without a trigger path, duplicate order/branch
 definitions that are ambiguous, and conditions referencing undeclared facts.
+
+### 5.1 Registration Complete acknowledgement rule
+
+Initial, mobility-update and periodic-update profiles define
+`REGISTRATION_COMPLETE` as `conditional`:
+
+```yaml
+stage_id: REGISTRATION_COMPLETE
+applicability: conditional
+condition:
+  op: eq
+  fact: attempt.registration_accept_requires_ack
+  value: true
+```
+
+Each release overlay owns an `AckRequirementRule` listing the normalized
+Registration Accept indicators/information elements that require an
+acknowledgement for that release, including applicable new identity assignment,
+SOR acknowledgement and NSSAI-related acknowledgement conditions. Deployment
+overlays may narrow behavior only when a standards/vendor profile and fixtures
+justify it; they cannot infer acknowledgement merely because another attempt
+sent Registration Complete.
+
+The decoder/normalizer preserves the relevant Registration Accept fields and
+T04 evaluates the selected rule:
+
+- `true`: missing Registration Complete on a visible N1 path is eligible for
+  T09 missing-transition evaluation.
+- `false`: the stage is `not_applicable`; Registration Accept can complete the
+  registration profile without a Registration Complete message.
+- `unknown`: absent/undecodable accept fields or encrypted/invisible N1 make
+  the stage `inconclusive`, never missing.
+
+Required fixtures per supported release/deployment: accept with each
+acknowledgement trigger and observed complete; same trigger with missing
+complete; accept with no trigger and no complete; accept fields unavailable;
+periodic and mobility variants for both required/not-required behavior.
+
+### 5.2 Non-3GPP access anchors and state
+
+The registry realizes the requirement-level non-3GPP behavior through these
+profile variants:
+
+| Profile/overlay | Required trigger/anchor facts | State and visibility intent |
+|---|---|---|
+| `registration.non_3gpp` + `access.untrusted_n3iwf` | `request.access_type=non_3gpp_untrusted`, `request.access_anchor_type=N3IWF`, NAS Registration Request and time-compatible N3IWF/N2 context | Independent untrusted non-3GPP registration state; NWu/IKE/IPsec/EAP facts are supporting anchors when captured, not mandatory when outside visibility |
+| `registration.non_3gpp` + `access.trusted_tngf` | `request.access_type=non_3gpp_trusted`, `request.access_anchor_type=TNGF`, NAS Registration Request and time-compatible TNGF/N2 context | Independent trusted non-3GPP registration state; trusted-access tunnel/session facts are supporting anchors when visible |
+| 3GPP registration profiles | `request.access_type=3gpp`, `request.access_anchor_type=GNB` | Independent 3GPP registration state under the same UE |
+| `mobility.access_transfer` | Explicit source/target access contexts and transfer/re-registration/session-continuity evidence | Links source and target contexts/attempts without merging their events or registration states |
+
+Base and release/deployment overlays declare trigger matchers, source/target
+access families, anchor matchers, access-scoped success/failure terminals,
+deregistration scope rules and session-continuity conditions. Unknown anchor
+type or invisible access-side signalling lowers confidence and produces
+`inconclusive`; it must not be guessed from IP address, shared AMF or timing.
+
+Required fixtures: simultaneous 3GPP+N3IWF registration, simultaneous
+3GPP+TNGF registration, independent success/failure on each access, N3IWF to
+3GPP transfer retaining a session, TNGF to 3GPP transfer, trusted/untrusted
+context replacement, access-scoped deregistration, both-access deregistration,
+and invisible/ambiguous anchor evidence.
 
 ## 6. Registry API and Resolution
 

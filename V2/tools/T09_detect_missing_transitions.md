@@ -98,6 +98,9 @@ Before evaluating stages, T09 validates that the profile/subtype remains compati
 
 - Emergency procedures use emergency-specific conditional stages.
 - Periodic registration does not require all initial-registration stages.
+- Registration Complete is evaluated only when the resolved release/profile
+  sets `attempt.registration_accept_requires_ack=true`; false is
+  `not_applicable`, unknown is `inconclusive`.
 - Local-breakout roaming does not require H-SMF/N9 stages.
 - Xn handover visible only at path switch does not require N2 preparation messages.
 - Optional authentication may be skipped when context is reused.
@@ -286,6 +289,9 @@ V2/harness/config/
 ### 23.3 Negative tests
 
 - Optional stage absent produces no failure.
+- Registration Accept without an acknowledgement trigger and no Registration
+  Complete produces no failure; required-ack, no-ack and unknown-field
+  fixtures cover initial, mobility and periodic profiles.
 - Invisible interface produces no failure.
 - Later downstream missing stages produce no independent primary candidate.
 - Hidden NRF/UDR stage is not evaluated by T09.

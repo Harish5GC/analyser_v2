@@ -32,6 +32,8 @@ T03 must not:
 - Connected-component assignments.
 - Ambiguous edge candidates and conflicts.
 - UE/session/context lookup indexes.
+- Time-bounded roaming topology classifications and independent fault-domain
+  maps for each resolved UE/access/session context.
 
 T04 consumes the graph but remains responsible for attempt segmentation.
 
@@ -46,7 +48,8 @@ class BuildIdentityGraphRequest(BaseModel):
 
 
 class IdentityGraphConfig(BaseModel):
-    rules_version: str
+    identity_rules: ResolvedPolicy
+    topology_rules: ResolvedPolicy
     supporting_signal_window_seconds: Decimal = Decimal("5")
     context_idle_timeout_seconds: Decimal = Decimal("30")
     max_candidate_edges_per_observation: int = 20
@@ -66,10 +69,85 @@ class BuildIdentityGraphResult(BaseModel):
     accepted_edges: int
     ambiguous_edges: int
     conflicts: int
+    topology_intervals: int
     warnings: list[IdentityWarning]
 ```
 
 The returned result contains counts and artifact descriptors. Downstream code opens the graph through `IdentityGraphReader`; it does not receive a large in-memory result object.
+
+### 4.1 Roaming topology output
+
+```python
+class TopologyEvidenceTerm(BaseModel):
+    fact: Literal[
+        "SERVING_PLMN", "HOME_PLMN", "SUCI_HOME_NETWORK", "GUAMI_PLMN",
+        "TAI_PLMN", "NF_DOMAIN", "SBI_ROUTING_DOMAIN", "DNN", "S_NSSAI"
+    ]
+    normalized_value: str
+    implication: Literal["home", "visited", "home_path", "visited_path", "inter_plmn", "neutral"]
+    weight: Decimal
+    evidence_ids: list[UUID]
+
+class TopologyAlternative(BaseModel):
+    topology: Literal["home", "visited_unknown", "home_routed", "local_breakout", "inconclusive"]
+    score: Decimal
+    reason_codes: list[str]
+
+class FaultDomainMap(BaseModel):
+    ue_id: UUID | None
+    access_context_id: UUID | None
+    home_plmn: str | None
+    serving_plmn: str | None
+    home_nf_domain_aliases: set[str]
+    visited_nf_domain_aliases: set[str]
+    inter_plmn_path_aliases: set[str]
+    upf_path_aliases: set[str]
+    evidence_ids: list[UUID]
+    confidence: Literal["high", "medium", "low", "inconclusive"]
+
+class RoamingTopologyInterval(BaseModel):
+    topology_id: UUID
+    ue_id: UUID | None
+    access_context_id: UUID | None
+    session_node_id: UUID | None
+    valid_from_frame: int
+    valid_to_frame: int | None
+    selected_topology: Literal["home", "visited_unknown", "home_routed", "local_breakout", "inconclusive"]
+    alternatives: list[TopologyAlternative]
+    evidence_terms: list[TopologyEvidenceTerm]
+    confidence: Literal["high", "medium", "low", "inconclusive"]
+    fault_domains: FaultDomainMap
+    rules_revision: str
+```
+
+Topology and fault domain are separate outputs: topology describes home versus
+visited routing; `FaultDomainMap` maps observed network entities/paths so T12
+can classify a particular failure as `UE`, `RAN`, `VISITED_CORE`, `HOME_CORE`,
+`INTER_PLMN`, `UPF_PATH` or `UNKNOWN`. A home-routed topology does not by itself
+prove that a failure belongs to the home core.
+
+### 4.2 Classification rules
+
+T03 evaluates time-compatible facts in this order:
+
+1. Resolve serving PLMN from TAI/GUAMI/access context and home PLMN from SUCI
+   home-network identity or trusted subscriber context.
+2. Equal trusted home/serving PLMN selects `home` unless stronger visited-path
+   evidence conflicts.
+3. Different home/serving PLMN establishes roaming but not routing mode;
+   classify `visited_unknown` until path evidence exists.
+4. V-SMF/visited consumer plus H-SMF/home-domain service and home-anchored UPF
+   evidence selects `home_routed`; an N9/inter-PLMN path strengthens it but its
+   invisibility alone does not disprove it.
+5. Visited SMF/UPF anchoring with no required H-SMF/N9 and compatible
+   authorization evidence selects `local_breakout`.
+6. Conflicting, masked, missing or low-confidence PLMN/domain mappings produce
+   scored alternatives and `inconclusive` when the lead over the next
+   alternative is below the configured threshold.
+
+Observed identifiers/domains outrank scenario hints. Domain matching uses
+configured masked suffix/PLMN mappings, never substring guesses. Every selected
+or rejected alternative persists score terms and evidence.
 
 ## 5. Graph Data Model
 
@@ -147,6 +225,38 @@ class IdentityConflict(BaseModel):
 - RAN UE NGAP ID.
 - SCTP association/stream as supporting context.
 - GUAMI, TAI, CGI, access type, serving PLMN.
+- Access family: `3gpp`, `non_3gpp_untrusted`, or `non_3gpp_trusted`.
+- 3GPP anchor: gNB identity plus time-bounded N2 association and NGAP IDs.
+- Untrusted non-3GPP anchor: N3IWF identity plus time-bounded N2 context and
+  normalized NWu/IKE/IPsec tunnel or EAP-session identifiers when visible.
+- Trusted non-3GPP anchor: TNGF identity plus time-bounded N2 context and
+  normalized trusted-access tunnel/session identifiers when visible.
+
+```python
+class AccessContextKey(BaseModel):
+    access_family: Literal["3gpp", "non_3gpp_untrusted", "non_3gpp_trusted"]
+    anchor_type: Literal["GNB", "N3IWF", "TNGF", "UNKNOWN"]
+    anchor_identity_alias: str | None
+    n2_association_alias: str | None
+    amf_ue_ngap_id: int | None
+    ran_ue_ngap_id: int | None
+    access_tunnel_alias: str | None
+    validity_start_frame: int
+    validity_end_frame: int | None
+
+class AccessRegistrationState(BaseModel):
+    ue_id: UUID
+    access_context_id: UUID
+    access_family: Literal["3gpp", "non_3gpp_untrusted", "non_3gpp_trusted"]
+    state: Literal["deregistered", "registering", "registered", "suspended", "unknown"]
+    state_event_ids: list[UUID]
+    valid_from_frame: int
+    valid_to_frame: int | None
+```
+
+An access context is keyed by the complete scoped tuple, not by UE identity or
+AMF UE NGAP ID alone. Missing tunnel/anchor fields reduce confidence but never
+permit a 3GPP and non-3GPP context to collapse into one node.
 
 ### 6.3 Session/context
 
@@ -164,6 +274,23 @@ class IdentityConflict(BaseModel):
 - PDR/FAR/QER relationship.
 
 Each identifier kind has an explicit uniqueness scope. For example, `pdu_session_id` is scoped to UE/access context and time; TEID is scoped to endpoint/direction/time; PFCP sequence is scoped to endpoint pair.
+
+### 6.5 Non-3GPP separation invariants
+
+- One UE component may own multiple simultaneous `ACCESS_CONTEXT` nodes, one
+  per active access-family/anchor/validity tuple.
+- Subscriber-level evidence may link those nodes to the same UE, but it does
+  not union the access-context nodes themselves.
+- N3IWF and TNGF contexts are distinct even when they share AMF, PLMN, UE or
+  PDU session identifiers. A trusted/untrusted access change creates a new
+  access context and an evidence-backed mobility edge.
+- A PDU session may have access-specific legs linked to one session node; leg
+  identity, registration state, tunnel state and attempt assignment remain
+  access-scoped.
+- Deregistration/release for one access family closes only that context unless
+  the decoded message explicitly scopes both access types.
+- Time proximity, shared AMF endpoint, DNN/S-NSSAI or subscriber identity alone
+  cannot merge concurrent access contexts.
 
 ## 7. Normalization and Privacy
 
@@ -289,6 +416,8 @@ Hard conflict examples:
 - One PFCP session linked to two incompatible active PDU sessions.
 - Old and new handover contexts overlap beyond allowed transition without mapping evidence.
 - Same GUTI reused after an explicit deregistration/context expiry.
+- Proposed union of active 3GPP, N3IWF and/or TNGF access contexts without an
+  explicit access-transfer relation.
 
 Resolution policy:
 
@@ -318,11 +447,17 @@ indexes/
   ue_index.jsonl
   session_index.jsonl
   context_index.jsonl
+  access_registration_state_index.jsonl
   identifier_index.jsonl
   event_identity_index.jsonl
+  roaming_topology_index.jsonl
+  fault_domain_index.jsonl
 ```
 
-Indexes contain node IDs, validity bounds, hashed lookup values, and evidence references. They must support lookup by event, masked identity, access IDs, session ID within UE, SM context, SEID, UE IP, and tunnel identity.
+Indexes contain node IDs, validity bounds, hashed lookup values, and evidence
+references. They must support lookup by event, masked identity, access-family /
+anchor / context tuple, access-scoped registration state, session ID within UE
+and access leg, SM context, SEID, UE IP, and tunnel identity.
 
 ## 16. Manifest
 
@@ -332,6 +467,8 @@ The graph manifest records:
 - T02 normalization manifest checksum.
 - Configuration hash.
 - Counts by node/edge/identifier/conflict type.
+- Topology/fault-domain rules revision, outcome/confidence counts and
+  alternative ambiguity counts.
 - Confidence histogram.
 - Provisional/incomplete node counts.
 - Artifact descriptors.
@@ -353,6 +490,8 @@ The graph manifest records:
 - Candidate explosion beyond configured cap: truncate weakest candidates, warn, and mark partial.
 - Hard graph invariant violation after resolution: fatal publication failure.
 - Ambiguity/conflict: not fatal; persist explicitly and return partial when above policy threshold.
+- Missing/conflicting roaming facts: persist `inconclusive` alternatives and
+  an `UNKNOWN` domain map; do not fail identity graph publication.
 - Disk/checksum/index publication failure: fatal.
 
 ## 19. Performance and Resource Requirements
@@ -394,6 +533,8 @@ V2/harness/analysis/
   conflicts.py              invariant and split handling
   union_find.py             accepted component construction
   session_linker.py         SM/PFCP/session-specific rules
+  roaming_topology.py       PLMN/domain/path classification
+  fault_domains.py          independent entity/path domain maps
 V2/harness/storage/
   identity_store.py
   identifier_index.py
@@ -408,9 +549,10 @@ V2/harness/models/
 3. Implement exact access and subscriber rules.
 4. Implement session/SM/PFCP strong rules.
 5. Add validity interval and identifier reuse handling.
-6. Add conflict detection and component splitting.
-7. Add persisted graph reader/indexes.
-8. Add handover/inter-AMF rules and performance fixtures.
+6. Add roaming topology alternatives and independent fault-domain maps.
+7. Add conflict detection and component splitting.
+8. Add persisted graph reader/indexes.
+9. Add handover/inter-AMF rules and performance fixtures.
 
 ## 24. Tests
 
@@ -425,6 +567,9 @@ V2/harness/models/
 - Sensitive hashing and masking.
 - Conflict detection and component split.
 - Candidate cap behavior.
+- Home, visited-unknown, home-routed, local-breakout and inconclusive topology
+  classification with deterministic alternatives.
+- Fault-domain maps remain independent from topology selection.
 
 ### 24.2 Integration tests
 
@@ -433,16 +578,25 @@ V2/harness/models/
 - GUTI and NGAP ID reuse after release.
 - Capture starting mid-procedure.
 - Inter-AMF handover old/new identifier mapping.
+- Concurrent 3GPP and N3IWF registrations for one UE remain separate access
+  nodes and registration states.
+- Trusted TNGF and untrusted N3IWF contexts remain distinct across access
+  mobility and identifier reuse.
+- Access-scoped deregistration closes one context without closing the other.
 - SBI SM context to PFCP SEID and UE-IP correlation.
 - Conflicting explicit SUPI/GUTI evidence.
 - Encrypted NAS with unresolved subscriber identity.
 - Large capture with bounded active-index memory.
+- Roaming attempt with home/serving PLMN and NF-domain/path evidence consumed
+  by T04/T11/T12/T14/T17.
 
 ### 24.3 Negative tests
 
 - Timestamp-only records remain unlinked.
 - Same DNN/slice does not merge UEs.
 - Same TEID on different endpoints does not merge tunnels.
+- Same UE/AMF/PLMN and overlapping time do not merge 3GPP, N3IWF or TNGF
+  access contexts.
 - T03 cannot open NRF/UDR readers.
 
 ## 25. Acceptance Criteria
@@ -458,4 +612,6 @@ T03 is complete when:
 7. Capture-boundary uncertainty is represented, not hidden.
 8. Sensitive values remain inside the trusted local boundary.
 9. Primary-only access is enforced by the constructor/interface.
-10. Large captures avoid all-pairs behavior and remain resource-bounded.
+10. Every topology/domain classification is time-bounded, evidence-backed,
+    revisioned and exposes alternatives/confidence without scenario override.
+11. Large captures avoid all-pairs behavior and remain resource-bounded.

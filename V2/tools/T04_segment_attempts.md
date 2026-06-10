@@ -41,7 +41,7 @@ class SegmentAttemptsRequest(BaseModel):
     analysis_id: UUID
     primary_reader: PrimaryEventReader
     identity_graph: IdentityGraphReader
-    profile_registry_version: str
+    profile_registry: ResolvedProfileRegistry
     config: AttemptSegmentationConfig
 
 
@@ -80,6 +80,9 @@ class ProcedureAttempt(BaseModel):
     analysis_id: UUID
     ue_id: UUID | None
     session_node_id: UUID | None
+    access_context_id: UUID | None
+    access_family: Literal["3gpp", "non_3gpp_untrusted", "non_3gpp_trusted", "unknown"]
+    access_anchor_type: Literal["GNB", "N3IWF", "TNGF", "UNKNOWN"]
     profile_id: str
     procedure_type: str
     subtype: str | None
@@ -103,6 +106,7 @@ class ProcedureAttempt(BaseModel):
     completion_reason: str
     assignment_confidence: Literal["high", "medium", "low"]
     visibility: InterfaceVisibility
+    roaming_topology: RoamingTopologyInterval | None
     warnings: list[str] = Field(default_factory=list)
 ```
 
@@ -191,6 +195,26 @@ Assignment order:
 
 Each assignment stores confidence and reason codes. An event may be shared between a parent and child attempt only when the profile nesting rule permits it; otherwise it has one owning attempt plus ambiguous candidates.
 
+### 9.1 Access-scoped registration and non-merge rules
+
+T04 reads the T03 `AccessContextKey` and `AccessRegistrationState` active at
+each event. Registration, service, deregistration and mobility state is keyed
+by `(ue_id, access_context_id, access_family)`, never by UE alone.
+
+- Concurrent 3GPP and non-3GPP Registration Requests always create separate
+  attempts even when subscriber identity, registration type and timing match.
+- N3IWF and TNGF registrations are separate attempts and state machines.
+- An event attaches to an attempt only when its access context matches or a
+  selected access-mobility profile contains an explicit context-transfer edge.
+- Access transfer links source and target attempts as parent/child or related
+  attempts according to the profile; it does not merge their event lists,
+  attempt IDs or registration states.
+- A deregistration scoped to 3GPP, non-3GPP or both closes exactly the declared
+  access states. Ambiguous scope is recorded and cannot close all contexts by
+  assumption.
+- A PDU session retained across access change preserves its session node but
+  opens a new access-leg/mobility attempt with source/target context evidence.
+
 ## 10. Retry Versus New Attempt
 
 A retry belongs to an open attempt when all required conditions hold:
@@ -209,6 +233,9 @@ A new attempt is required when any decisive condition holds:
 - Explicit new registration/session trigger after completion.
 - Retry/idle window expired.
 - Identity validity interval changed.
+- Access family, anchor type or access-context validity interval changed,
+  except that an explicit profile-defined mobility relation links the old/new
+  attempts without merging them.
 - Profile defines the message as a new attempt rather than retransmission.
 
 Repeated requests with ambiguous transaction information remain assignment candidates and lower attempt confidence; they are not blindly merged.
@@ -281,7 +308,8 @@ T04 stores a stable request signature for T11 baseline selection:
 - Procedure/profile/subtype.
 - Registration/service request type.
 - DNN, S-NSSAI, PDU type, SSC mode.
-- Access type, emergency flag, roaming topology when known.
+- Access type, emergency flag, and the exact T03 roaming-topology interval
+  revision/evidence active at the attempt trigger.
 - PDU session ID only as scoped context, not global identity.
 
 Dynamic frames, timestamps, stream IDs, sequence numbers, SEIDs, TEIDs, UUIDs, and ports are excluded.
@@ -428,6 +456,9 @@ V2/harness/models/
 - Registration with nested authentication/security.
 - Paging followed by service request.
 - Periodic, mobility, emergency, and non-3GPP registration.
+- Concurrent 3GPP/N3IWF registration, concurrent 3GPP/TNGF registration and
+  N3IWF-to-TNGF/3GPP access mobility without attempt merging.
+- Access-scoped deregistration for 3GPP, non-3GPP and both-access values.
 - Xn path switch, N2 handover, and inter-AMF handover.
 - Roaming home-routed and local-breakout procedures.
 - Capture starting/ending mid-attempt.

@@ -42,7 +42,7 @@ class ValidateScenarioRequest(BaseModel):
     dependency_results: list[DependencyInspectionResult] = Field(default_factory=list)
     pass_stage: EvidenceStage
     primary_validation_revision: str | None = None
-    validator_policy_version: str
+    validator_policy: ResolvedPolicy
 
 
 class ValidateScenarioResult(BaseModel):
@@ -122,6 +122,10 @@ Capture/interface/identity/attempt selection is insufficient, a required depende
 ### Not applicable
 
 Checkpoint condition is false for the selected procedure/profile/topology or no selected attempt falls within its defined scope.
+
+Roaming conditions consume the T03 topology interval and alternatives attached
+to T04. An `inconclusive` topology cannot verify home-routed/local-breakout
+expectations and must preserve the competing alternatives/evidence.
 
 ## 9. Request Expectation Validation
 

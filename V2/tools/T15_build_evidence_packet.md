@@ -34,12 +34,45 @@ Expanded inputs add admitted T24/T25 `DependencyInspectionResult` objects, the d
 ## 4. Python Tool Contracts
 
 ```python
+class TokenCounterSpec(BaseModel):
+    method: Literal["pinned_tokenizer", "utf8_bytes_v1"]
+    tokenizer_id: str
+    tokenizer_version: str
+    vocabulary_checksum: str | None = None
+    canonical_serialization: Literal["canonical_json_v1"] = "canonical_json_v1"
+
+
+class ResolvedTokenBudget(BaseModel):
+    context_window_tokens: int
+    configured_input_cap: int
+    hard_input_cap: int
+    reserved_system_tokens: int
+    reserved_output_tokens: int
+    provider_framing_tokens: int
+    safety_margin_tokens: int
+    target_min_tokens: int
+    target_max_tokens: int
+    effective_input_tokens: int
+    soft_target_tokens: int
+    counter: TokenCounterSpec
+
+
+class EvidencePacketConfig(BaseModel):
+    target_min_tokens: int = 2000
+    target_max_tokens: int = 8000
+    hard_input_cap: int = 12000
+    safety_margin_tokens: int = 256
+    max_alternatives: int = 5
+    max_timeline_items: int = 20
+    max_comparisons: int = 2
+
+
 class BuildInitialEvidenceRequest(BaseModel):
     schema_version: Literal["2.0"] = "2.0"
     analysis_id: UUID
     attempt_id: UUID
     provider_mode: Literal["local", "openrouter"]
-    model_context_limit: int
+    token_budget: ResolvedTokenBudget
     config: EvidencePacketConfig
 
 
@@ -48,13 +81,14 @@ class BuildExpandedEvidenceRequest(BaseModel):
     dependency_results: list[DependencyInspectionResult]
     expanded_root_cause: RootCauseResult
     scenario_validation: ValidateScenarioResult | None
-    final_model_context_limit: int
+    token_budget: ResolvedTokenBudget
 
 
 class BuildEvidencePacketResult(BaseModel):
     packet: EvidencePacket
     artifact: ArtifactDescriptor
-    token_estimate: int
+    token_count: int
+    token_counter: TokenCounterSpec
     truncations: list[EvidenceTruncation]
     warnings: list[str]
 ```
@@ -67,6 +101,7 @@ class EvidencePacket(BaseModel):
     packet_id: UUID
     analysis_id: UUID
     pass_stage: EvidenceStage
+    token_budget: ResolvedTokenBudget
     task: Literal["diagnose_failed_attempt"]
     schema_guide: EvidenceSchemaGuide
     ue: MaskedUEIdentity
@@ -179,20 +214,68 @@ The guide is versioned and counted in the token budget.
 
 ## 10. Token Budget Calculation
 
-Configuration:
-
-- Target minimum/maximum, typically 2,000-8,000 input tokens.
-- Hard maximum default 12,000 for local models or lower provider context budget after reserving output/system tokens.
-- Provider/model tokenizer when available; conservative fallback estimator otherwise.
+The orchestrator resolves provider/model limits and the counting method once at
+startup. T15 never probes tokenizer availability or changes methods during a
+run. The same immutable `ResolvedTokenBudget` is supplied to T15 and validated
+again by T16.
 
 ```text
-available_input = model_context
+available_input = context_window_tokens
                 - reserved_system_tokens
                 - reserved_output_tokens
-                - safety_margin
+                - provider_framing_tokens
+                - safety_margin_tokens
+
+effective_input_tokens = min(
+    available_input,
+    configured_input_cap,
+    hard_input_cap,
+)
+
+soft_target_tokens = min(target_max_tokens, effective_input_tokens)
 ```
 
-Build incrementally and recompute after each content block.
+All values must be positive and internally consistent; a non-positive
+`effective_input_tokens` is a provider/model configuration failure before T15.
+The local default `hard_input_cap` is 12,000. Remote/provider profiles may set
+a lower cap. `target_min_tokens` and `target_max_tokens` are quality targets,
+not alternate hard limits.
+
+`reserved_system_tokens` is counted from the exact versioned system prompt and
+response schema with the selected counter. `provider_framing_tokens` comes
+from the pinned provider/model profile. `reserved_output_tokens` equals the
+validated T16 maximum output setting.
+
+### 10.1 Deterministic counting method
+
+`pinned_tokenizer` names an installed tokenizer artifact/version and optional
+vocabulary checksum. If that exact artifact is unavailable, startup fails
+unless configuration explicitly selected the fallback profile; the run never
+silently switches counters.
+
+`utf8_bytes_v1` counts one token per byte of canonical UTF-8 JSON. It is
+deliberately conservative and deterministic, including escaped strings,
+Unicode and numeric text. It may be used only for provider/model profiles whose
+conformance corpus proves actual token count never exceeds this estimate.
+Unsupported tokenizers require a new validated counter profile.
+
+Provider-reported token usage and remotely reported tokenizer counts are
+observability data only; they never change trimming or packet identity.
+
+Build incrementally using canonical serialization and recompute after each
+content block. Optional content stops at `soft_target_tokens`. Mandatory
+content may exceed the soft target but must not exceed
+`effective_input_tokens`.
+
+### 10.2 Below-target and over-budget behavior
+
+When `effective_input_tokens < target_min_tokens`, T15 builds a mandatory-only
+packet first and emits `T15_TOKEN_BUDGET_BELOW_TARGET`. Optional content is
+added only if it still fits. This is not a construction failure by itself.
+
+If mandatory content exceeds `effective_input_tokens`, T15 fails with
+`T15_EVIDENCE_BUDGET_EXCEEDED`, records per-block counts and never removes the
+mandatory evidence guarantee.
 
 ## 11. Trimming Algorithm
 
@@ -293,7 +376,11 @@ No hidden counts, failure hints, or flow summaries are leaked through the descri
 
 ## 18. Deterministic Packet ID and Persistence
 
-Packet ID UUIDv5 includes input revision hashes, pass stage, provider privacy mode, schema-guide version, and token-budget configuration.
+Packet ID UUIDv5 includes input revision hashes, pass stage, provider privacy
+mode, schema-guide version, the complete resolved token budget, counter method,
+tokenizer/version/checksum and canonical-serialization version. The resulting
+packet ID is assigned before the final provider-bound count; token count is
+stored and validated but is not an input to its own identifier.
 
 For an expanded packet, input revisions include the parent packet ID, expanded T12 revision, applicable T14 revision and sorted dependency-result revisions. Rebuilding with the same logical inputs in a different completion order must produce the same packet ID.
 
@@ -323,7 +410,10 @@ Invalid packet never reaches T16.
 
 - Missing primary candidate evidence: fail packet construction, unless deterministic result is explicitly inconclusive with no candidate.
 - Unresolvable secondary evidence: omit with warning.
-- Mandatory content exceeds budget: fail with `EVIDENCE_BUDGET_EXCEEDED` and detailed block sizes.
+- Effective budget below target minimum: publish a valid mandatory-first packet
+  with `T15_TOKEN_BUDGET_BELOW_TARGET` when mandatory content fits.
+- Mandatory content exceeds effective budget: fail with
+  `T15_EVIDENCE_BUDGET_EXCEEDED` and detailed block counts/sizes.
 - Masking failure: fatal for remote provider.
 - Dependency result belongs to another attempt/packet: reject.
 - Expanded T12/T14 lineage does not match the initial packet or admitted dependency revisions: reject.
@@ -391,7 +481,11 @@ V2/harness/schemas/
 
 - Content priority and trimming order.
 - Mandatory block protection.
-- Token estimator/tokenizer and safety margin.
+- Exact pinned tokenizer and `utf8_bytes_v1` counting, including method identity.
+- Effective-budget precedence and safety/provider-framing reserves.
+- Below-target mandatory-only packet and mandatory-over-budget failure.
+- Adversarial Unicode, escapes, long numbers and deeply nested JSON strings.
+- Missing/wrong tokenizer version or vocabulary checksum fails at startup.
 - Candidate/evidence/frame validation.
 - Stable masking aliases.
 - Packet UUID/revision.
@@ -415,6 +509,8 @@ V2/harness/schemas/
 - Very large primary record summarized through T18.
 - Many retries/alternatives compressed correctly.
 - Mandatory evidence itself exceeds budget.
+- Identical inputs with the same counter profile produce byte-identical
+  trimming, packet token count and packet ID.
 
 ## 27. Acceptance Criteria
 

@@ -573,9 +573,21 @@ Default limits:
 - One UE request object.
 - At most two comparison attempts.
 - Target 2,000-8,000 input tokens.
-- Hard limit 12,000 input tokens for local models.
+- Default packet hard cap 12,000 input tokens for local models; provider/model
+  profiles or configuration may lower it.
 
-The packet must contain schema descriptions, evidence IDs and no raw unbounded decoder trees.
+The startup resolver must pin a model context window, output reserve, exact
+prompt/schema reserve, provider-framing reserve, safety margin and deterministic
+token counter. The effective packet budget is the minimum of the configured
+input cap, packet hard cap and remaining model context after those reserves.
+If it is below the target minimum, T15 builds mandatory evidence first and
+warns; if mandatory evidence itself cannot fit, construction fails without
+dropping it.
+
+The packet must contain schema descriptions, evidence IDs and no raw unbounded
+decoder trees. Trimming and packet identity use the pinned counter. Provider-
+reported token usage is recorded separately and cannot change deterministic
+packet construction.
 
 ### T16: `generate_diagnosis`
 
@@ -588,6 +600,8 @@ Requirements:
 - Use low temperature (`0` to `0.2`).
 - Instruct the model to use only supplied evidence.
 - Validate and retry malformed output once.
+- Recount the exact serialized provider request with the same pinned counter
+  and reject it before transport when packet/input/output/context limits fail.
 - Fall back to deterministic report generation after provider failure.
 - Record provider, model, latency and token usage without recording API keys.
 
@@ -857,11 +871,16 @@ INITIAL_REGISTRATION_REQUEST
 -> ACCESS_AND_MOBILITY_POLICY (conditional)
 -> INITIAL_CONTEXT_SETUP (conditional)
 -> REGISTRATION_ACCEPT
--> REGISTRATION_COMPLETE
+-> REGISTRATION_COMPLETE (conditional: Registration Accept requires acknowledgement)
 -> REGISTERED
 ```
 
-Failures include Registration Reject, authentication reject/failure, security mode reject, subscriber-not-found, roaming restriction, slice rejection, illegal UE/ME, PLMN/TA restriction, NGAP context setup failure and missing Registration Accept/Complete.
+Failures include Registration Reject, authentication reject/failure, security
+mode reject, subscriber-not-found, roaming restriction, slice rejection,
+illegal UE/ME, PLMN/TA restriction, NGAP context setup failure, missing
+Registration Accept, and missing Registration Complete only when the decoded
+Registration Accept plus selected release/deployment profile requires UE
+acknowledgement.
 
 #### Mobility registration update
 
@@ -880,7 +899,7 @@ MOBILITY_REGISTRATION_REQUEST
 -> LOCATION_AND_SUBSCRIPTION_UPDATE
 -> SESSION_CONTEXT_TRANSFER_OR_UPDATE (conditional/repeatable)
 -> REGISTRATION_ACCEPT
--> REGISTRATION_COMPLETE
+-> REGISTRATION_COMPLETE (conditional: Registration Accept requires acknowledgement)
 -> OLD_CONTEXT_RELEASE (conditional)
 -> REGISTERED
 ```
@@ -901,11 +920,15 @@ PERIODIC_REGISTRATION_REQUEST
 -> OPTIONAL_AUTH_OR_SECURITY_REFRESH
 -> OPTIONAL_SUBSCRIPTION_OR_LOCATION_REFRESH
 -> REGISTRATION_ACCEPT
--> REGISTRATION_COMPLETE (conditional by observed behavior)
+-> REGISTRATION_COMPLETE (conditional: Registration Accept requires acknowledgement)
 -> REGISTERED
 ```
 
-The tool must distinguish periodic update from initial/mobility registration and detect repeated periodic-update failures, timer-driven retry loops, context loss and unexpected full re-authentication.
+The tool must distinguish periodic update from initial/mobility registration
+and detect repeated periodic-update failures, timer-driven retry loops, context
+loss and unexpected full re-authentication. Observed behavior alone cannot make
+Registration Complete mandatory; applicability comes from the release/profile
+acknowledgement rule and decoded Registration Accept contents.
 
 #### Emergency registration
 
@@ -929,7 +952,14 @@ The profile must support limited-service and unauthenticated-emergency variants.
 
 #### Registration over non-3GPP access
 
-The profile must distinguish trusted/untrusted non-3GPP access, N3IWF/TNGF-related context and access-specific registration state. A registration on 3GPP access and one on non-3GPP access may coexist under the same UE and must not be merged into one attempt.
+The profile must distinguish trusted/untrusted non-3GPP access, N3IWF/TNGF-
+related context and access-specific registration state. T03 must create
+separate time-bounded access-context nodes for gNB, N3IWF and TNGF anchors;
+T04 must key registration/attempt state by that context. A registration on
+3GPP access and one on non-3GPP access may coexist under the same UE and must
+not be merged into one attempt. Explicit access mobility links source/target
+contexts while preserving both histories, and access-scoped deregistration
+must not close another active access by assumption.
 
 #### Registration failure recovery
 
@@ -1285,6 +1315,12 @@ timeout_seconds: 120
 temperature: 0.1
 max_output_tokens: 2000
 max_input_tokens: 12000
+model_context_window_tokens: integer from resolved model profile
+model_profile_version: string
+token_counter_profile: pinned tokenizer profile | utf8_bytes_v1
+max_total_calls_per_pass: 3
+max_transport_retries_per_pass: 1
+max_content_recovery_calls_per_pass: 1
 ```
 
 Provider behavior:
@@ -1292,6 +1328,17 @@ Provider behavior:
 - `local`: API key optional; suitable for vLLM, Ollama OpenAI endpoint or LM Studio.
 - `openrouter`: API key mandatory.
 - `none`: deterministic tools and report only.
+
+For `local` and `openrouter`, model/profile and counter artifacts are resolved
+once, schema/checksum validated and recorded in the run manifest. Missing or
+mismatched tokenizer/profile versions fail configuration; runtime availability
+must not silently change the counting method.
+
+Every provider invocation consumes one persisted per-pass call budget. V2
+allows at most one transport retry and one content-recovery call; content
+recovery is either structured-output fallback or schema repair, not both.
+Default total is three calls per pass, and every call/outcome/terminal reason
+must remain auditable after cancellation or restart.
 
 No provider-specific logic may leak into protocol tools.
 
@@ -1308,6 +1355,11 @@ No provider-specific logic may leak into protocol tools.
 
 ### Reliability
 
+- Resolve every profile, policy, cause dictionary, timeout table, visibility
+  registry and model/tokenizer profile before T01 into immutable,
+  schema-validated, checksummed handles. Missing, corrupt, incompatible or
+  checksum-mismatched versions fail startup; tools must not accept bare version
+  strings or silently fall back during a run.
 - A model outage must not discard deterministic findings.
 - Partial protocol visibility must be reported explicitly.
 - Re-running the same PCAP and configuration must produce the same deterministic findings.

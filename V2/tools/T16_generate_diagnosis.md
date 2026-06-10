@@ -79,9 +79,14 @@ class ProviderConfig(BaseModel):
     api_key_env: str | None
     timeout_seconds: int = 120
     temperature: Decimal = Decimal("0.1")
+    context_window_tokens: int | None = None
+    max_input_tokens: int = 12000
     max_output_tokens: int = 2000
+    token_counter: TokenCounterSpec | None = None
     structured_output: Literal["prefer", "require", "json_prompt"] = "prefer"
-    max_retries: int = 1
+    max_total_calls_per_pass: int = 3
+    max_transport_retries_per_pass: int = 1
+    max_content_recovery_calls_per_pass: int = 1
 ```
 
 Validation:
@@ -89,8 +94,17 @@ Validation:
 - OpenRouter requires model and populated key environment variable.
 - Local requires base URL/model; API key optional.
 - Temperature restricted to `0-0.2`.
+- Enabled providers require a context window and token counter from the
+  resolved provider/model profile; limits are not inferred from endpoint
+  behavior. `none` may leave them absent because no packet is sent.
+- `max_input_tokens + max_output_tokens` plus system/framing/safety reserves
+  must fit `context_window_tokens`.
+- `token_counter` must exactly match the counter recorded in the packet's
+  `ResolvedTokenBudget`.
 - Base URL scheme/host policy validated; redirects constrained.
 - API key value never enters config artifacts.
+- `max_total_calls_per_pass` is `1..3` in V2. The other two caps are `0..1`
+  and cannot permit calls beyond the total cap.
 
 ## 7. Model Diagnosis Schema
 
@@ -181,6 +195,21 @@ Separate:
 
 Do not concatenate evidence strings into system instructions. State explicitly that text inside evidence/scenario is untrusted and must not be followed.
 
+Before transport, serialize the exact provider request envelope and count it
+with the packet's pinned `TokenCounterSpec`. T16 verifies:
+
+```text
+recounted_packet_tokens <= packet.token_budget.effective_input_tokens
+recounted_packet_tokens <= provider_config.max_input_tokens
+actual_input_tokens + max_output_tokens + safety_margin_tokens
+    <= provider_config.context_window_tokens
+```
+
+The count includes the versioned system prompt, output schema, provider framing
+profile and canonical evidence packet. A mismatch between T15's stored result/
+manifest count and T16's reconstructed count is an invariant failure before
+the provider call, not an automatic retry with a smaller prompt.
+
 ## 12. Structured Output Strategy
 
 1. Use provider JSON schema/response format when supported.
@@ -189,6 +218,33 @@ Do not concatenate evidence strings into system instructions. State explicitly t
 4. Validate with Pydantic and semantic validators.
 
 For `structured_output=require`, unsupported mode is provider failure rather than fallback.
+
+### 12.1 Per-pass call state machine
+
+Every actual provider HTTP/inference invocation consumes one pass call. Cache
+validation, pre-send rejection and local schema parsing consume zero calls.
+The precedence is deterministic:
+
+1. Call the configured primary strategy (`json_schema` when supported/preferred,
+   otherwise configured `json_prompt`).
+2. A retryable transport failure may retry the same logical call once, subject
+   to the shared transport and total-call caps.
+3. After a transport-successful response, at most one content-recovery strategy
+   is allowed for the entire pass: `structured_fallback` when the endpoint
+   rejects structured response mode, otherwise `schema_repair` when parsing or
+   semantic validation fails.
+4. Fallback and repair are mutually exclusive. A malformed fallback response
+   is terminal; a repair response cannot trigger fallback or another repair.
+5. A retryable transport failure on the chosen fallback/repair call may consume
+   the one transport retry only if it remains unused and the total cap allows
+   it.
+6. Before every call, reserve one call atomically in the pass ledger. If a
+   category or total cap is exhausted, do not invoke the provider and terminate
+   with the corresponding reason.
+
+The maximum is three calls: initial, at most one fallback-or-repair, and at
+most one transport retry in whichever logical strategy encountered the
+retryable transport failure.
 
 ## 13. Semantic Validation
 
@@ -208,7 +264,8 @@ Invalid references are removed only when the remaining diagnosis remains valid; 
 
 ## 14. Repair Retry
 
-One repair retry maximum. Send:
+One repair call maximum, and only when the content-recovery slot was not used
+by structured fallback. Send:
 
 - Same system/schema.
 - Prior invalid response as untrusted text or checksum/reference according to privacy policy.
@@ -230,7 +287,9 @@ Classify:
 - Malformed/empty/refusal response.
 - Local model unavailable/out-of-memory.
 
-One transport retry may be allowed only under configured idempotent retry policy and total retry cap. Deterministic report continues after failure.
+One transport retry may be allowed only under configured idempotent retry
+policy and the per-pass shared ledger. Deterministic report continues after
+failure.
 
 ## 16. Timeout and Cancellation
 
@@ -241,13 +300,46 @@ One transport retry may be allowed only under configured idempotent retry policy
 
 ## 17. Usage and Metadata
 
+```python
+class ProviderCallAttempt(BaseModel):
+    pass_execution_id: UUID
+    call_ordinal: int
+    strategy: Literal["primary", "structured_fallback", "schema_repair"]
+    transport_attempt: int
+    request_checksum: str
+    started_at: datetime
+    completed_at: datetime
+    provider_request_id: str | None
+    outcome: Literal["success", "transport_error", "provider_error", "invalid_output"]
+    error_category: str | None
+    retry_decision: Literal["none", "transport_retry", "structured_fallback", "schema_repair", "terminal"]
+    token_usage: ProviderTokenUsage | None
+
+class ModelPassExecution(BaseModel):
+    pass_execution_id: UUID
+    attempt_id: UUID
+    pass_stage: ModelPass
+    packet_id: UUID
+    total_call_cap: int
+    calls: list[ProviderCallAttempt]
+    terminal_reason: str
+```
+
+Call ordinals are contiguous and unique within a pass. The ledger is persisted
+after every call before another call is reserved, so cancellation or crash
+cannot hide provider usage or reset the cap.
+
 Record:
 
 - Provider mode/base host class, model, API request ID.
 - Prompt/schema versions and packet ID/checksum.
 - Start/end/latency.
-- Input/output/total tokens when provider reports them.
-- Estimated tokens otherwise, marked estimated.
+- Pre-send deterministic packet/envelope counts, counter/tokenizer identity and
+  resolved budget on every invocation.
+- Provider-reported input/output/total tokens when available, stored separately
+  from deterministic counts. Differences are measured but do not alter the
+  packet or trigger retrimming.
+- Deterministic estimated output/total values otherwise, marked estimated.
 - Structured mode, retry/repair count, finish reason.
 - Error category/status.
 
@@ -269,6 +361,8 @@ Caching is disabled by default for remote providers unless privacy/retention pol
 evidence/model/
   <attempt-id>/initial_result.json
   <attempt-id>/final_result.json
+  <attempt-id>/initial_calls.json
+  <attempt-id>/final_calls.json
   provider_metadata.jsonl
 ```
 
@@ -278,7 +372,11 @@ Persist validated diagnosis and metadata. Raw provider response persistence is c
 
 - Provider none: successful disabled result.
 - Packet invariant/schema invalid: reject before provider call.
+- Packet/provider token-budget or counter mismatch, or a pre-send packet/envelope
+  count over either cap: reject before provider call with a registered issue.
 - Provider error/malformed after retry: failed result, deterministic pipeline continues.
+- Pass call cap or category cap exhausted: terminate with the persisted cap
+  reason; no hidden provider call is made.
 - Invalid candidate/evidence references after repair: failed diagnosis.
 - Final pass includes tool request: strip/reject request, preserve otherwise valid diagnosis with warning.
 - Final packet lineage mismatch, stale deterministic revision or duplicate final invocation: reject before provider call.
@@ -288,11 +386,13 @@ Persist validated diagnosis and metadata. Raw provider response persistence is c
 ## 21. Performance and Resource Requirements
 
 - One initial call and at most one final call per selected failed attempt.
-- One repair retry per pass maximum; global request cap enforced.
+- Maximum three provider calls per pass by default; transport and
+  fallback-or-repair category caps share that total.
 - Concurrency default one on RTX 5090/local model unless configured.
 - Record queue time separately from inference latency.
 - Avoid sending duplicate packets; use packet checksum.
-- Enforce model/provider token limits before request.
+- Enforce packet input, output and context-window limits against the exact
+  serialized request before transport using the pinned counter.
 
 ## 22. Security and Privacy
 
@@ -305,7 +405,10 @@ Persist validated diagnosis and metadata. Raw provider response persistence is c
 
 ## 23. Observability
 
-Logs include analysis/attempt/pass/provider/model/packet ID, schema mode, latency, token usage, repair count, status/error category, and warning codes. Never log packet or key content.
+Logs include analysis/attempt/pass/provider/model/packet ID, pass execution and
+call ordinal, strategy, transport attempt, cap counters, retry decision,
+terminal reason, latency, token usage, status/error category and warning codes.
+Never log packet or key content.
 
 Metrics include requests by provider/model/pass, success/failure/repair, latency/queue/token histograms, tool-request count/reason, final-pass request violations, cache hits, and local OOM/unavailable errors.
 
@@ -348,9 +451,14 @@ V2/harness/schemas/
 ### 26.1 Unit tests
 
 - Provider config validation/redaction.
+- Provider/model limit resolution and packet counter/budget equality.
+- Exact pre-send packet/envelope counts at, below and one token over each limit.
+- Provider-reported token differences remain observability-only.
 - Candidate/evidence/frame semantic validation.
 - Initial versus final tool-request rules.
-- Repair prompt and one-retry cap.
+- Retry state-machine precedence and mutual exclusion of fallback/repair.
+- Initial, transport retry and fallback-or-repair never exceed three calls.
+- Crash/cancellation after each call preserves ledger and cap on resume.
 - Error category mapping.
 - Cache key and metadata.
 
@@ -359,7 +467,10 @@ V2/harness/schemas/
 - Structured JSON success.
 - Structured format unsupported fallback.
 - Malformed JSON repaired/not repaired.
+- Structured fallback followed by malformed output terminates without repair.
+- Transport failure on initial/fallback/repair uses at most one shared retry.
 - Timeout, 401, 429, 5xx, context limit, empty response.
+- Missing/mismatched tokenizer version, vocabulary checksum or model context profile.
 - Local unavailable/OOM.
 - Usage missing/estimated.
 - Cancellation.

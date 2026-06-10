@@ -91,6 +91,9 @@ Each attempt report includes:
 - Dependency inspection summaries when performed.
 - Model explanation and deterministic conflicts, clearly labeled advisory.
 - Evidence references/frames.
+- Roaming topology, confidence, evidence terms and competing alternatives from
+  T03, rendered separately from each failure candidate's independently mapped
+  fault domain.
 
 Successful attempts may be summarized more compactly but remain listed.
 
