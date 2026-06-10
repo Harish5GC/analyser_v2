@@ -115,21 +115,89 @@ it). Backlog items are V2-001..V2-062 in priority groups P0-P4.
   blueprint, writer/counter invariants, protocol-specific normalizer
   algorithms, manifest/descriptor shapes and a small-model implementation
   checklist.
-- **T03**: config `auto_link_threshold`/`warning_link_threshold` replace
-  `minimum_auto_link_confidence`; §9 band semantics; boundary tests (V2-016).
-- **T04**: result gains `revision: str`; §6 points to `profiles/README.md`
-  as the normative registry contract (V2-011/V2-017).
-- **T06**: request takes `context: DetectionContext` (replaces
-  `capture_phases` + `operation_policy_version`); §5 ownership/evidence-
-  registry note; §6 resolver note (V2-006/007/008).
-- **T07**: non-goals state T09's sole ownership of implicit absence + the
-  `0.65` base; inputs/request take `context` (replace `visibility` +
-  `cause_dictionary_version`); §16 ownership note (V2-006/007/061).
-- **T08**: inputs/request take `context` (replaces `policy_version`); §14
-  ownership note (V2-006/007).
-- **T09**: inputs/request take `context` (replace `visibility`/`capture`/
-  `timeout_policy_version`); sole-owner statement; profile-registry pointer;
-  §15 ownership note (V2-006/007/017/061).
+- **T03**: completed P0-P3 tool-spec pass. It now pins T02/reader lineage and
+  resolved identity/topology/masking policies, uses shared issue/revision/
+  descriptor/evidence contracts, defines typed observation/rule/index/reader
+  models, separates same-type unions from cross-type associations, and gives
+  deterministic algorithms for extraction, candidate generation, scoring,
+  validity, conflict splitting, registration state, roaming topology and
+  independent fault-domain maps. It also includes the canonical output tree,
+  manifest/descriptor shapes, writer/publication invariants, access-control
+  rules, unit/integration/golden/negative tests and a 35-step mechanical
+  implementation checklist. Config `auto_link_threshold`/
+  `warning_link_threshold` replaces `minimum_auto_link_confidence`; threshold
+  boundary semantics remain aligned with LLD §4.4 (V2-016 plus P1-P3
+  reconciliation).
+- **T04**: completed P0-P3 tool-spec pass. It now pins T02/T03/reader lineage,
+  capture bounds and resolved profile/visibility registries; defines typed
+  assignments/relationships; specifies deterministic profile selection,
+  assignment, retry, transition, closure, timing and sequence algorithms; and
+  preserves access-family/profile-alternative invariants. It also defines the
+  full output/index tree, descriptors, revision/manifest inputs, runner
+  blueprint, publication invariants, issue codes, unit/integration/golden/
+  access-control tests and a 30-step mechanical checklist. The result retains
+  explicit `revision`, and §6 keeps `profiles/README.md` as the single
+  normative registry contract (V2-011/V2-017 plus P1-P3 reconciliation).
+- **T05**: completed P0-P3 tool-spec pass. It now receives a revision-pinned
+  attempt/readers plus a typed `primary_internal` evidence capability,
+  validates that capability after direct-ID/index/cursor/selector expansion,
+  and explicitly forbids NRF/UDR resolution. It defines deterministic
+  profile-family field extraction, source precedence, conflicts, missing-field
+  recovery, masking, evidence minting and request timing; per-attempt immutable
+  output/manifest/index registration; revision/descriptor/publication
+  invariants; issue codes; security/golden tests; and a 23-step mechanical
+  checklist (V2-049/V2-055 contract coverage plus P0-P3 reconciliation).
+- **T06**: completed P0-P3 tool-spec pass. It validates attempt/T02/T04/T21
+  lineage and resolved operation/scoring policies; defines deterministic HTTP
+  transaction assembly, policy resolution, capability-gated structural
+  validation, retry/redirect grouping, candidate scoring/evidence minting and
+  dependency suspicion rules; and removes behavioral `V2.1` wording. It now
+  publishes parallel-safe per-attempt detector artifacts with revision,
+  descriptors, manifest and validation invariants, issue codes,
+  evidence-resolution/security/golden tests and a 22-step mechanical
+  checklist. `DetectionContext` remains the shared phase/visibility/policy
+  input and candidate ownership stays aligned with LLD §4.6 (V2-006/007/008
+  plus P1-P3 reconciliation).
+- **T07**: completed P0-P3 tool-spec pass. It now validates assigned-primary
+  attempt/T02/T04/T21 lineage and resolved cause/scoring policies, removes the
+  vague detector-side full-tree/T18 fallback, and specifies deterministic NAS/
+  NGAP projection, explicit rule evaluation, item-level resource scoping,
+  terminal effects, scoring and evidence minting. It publishes separate
+  request-only observations for T09 and never emits implicit-absence
+  candidates; per-attempt revision/descriptors/manifest, publication
+  invariants, issue codes, evidence/security/golden tests and a 20-step
+  checklist are defined. `DetectionContext` and T09's sole ownership of the
+  `0.65` implicit base remain intact (V2-006/007/061 plus P1-P3
+  reconciliation).
+- **T08**: completed P0-P3 tool-spec pass. It now defines a run-scoped,
+  attempt-independent PFCP node-state/association catalog plus per-attempt
+  causal links/candidates; deterministic transaction pairing and validity
+  epochs; Session Report classification/mapping; SEID/rule checks; and
+  profile/stage/direction-aware N3/N9 consistency. PFCP observation
+  `outcome="unknown"` remains distinct from diagnostic `inconclusive`.
+  Resolved policies, evidence minting, parallel-safe revisions/descriptors/
+  manifests, publication invariants, issue codes, security/golden tests and a
+  22-step checklist are specified (V2-006/007/V2-028/V2-029/V2-030/V2-053
+  reconciliation).
+- **T09**: completed P0-P3 tool-spec pass. It now requires published,
+  revision-matched T06/T07/T08 results; compiles the exact profile into a
+  validated stage DAG; specifies deterministic occurrence, applicability,
+  branch/join, visibility and deadline evaluation; and links/suppresses
+  explicit failures causally. T07 request-only observations and T08 routine
+  reports remain non-candidates. T09 solely owns implicit paging/service/
+  MT-delivery absence and the `0.65` base. Per-attempt stage/suppression/
+  candidate/timing artifacts, evidence/revision/descriptors/manifest,
+  publication invariants, issue codes, golden/security tests and a 22-step
+  checklist are defined (V2-006/007/017/033/034/061 reconciliation).
+- **T10**: completed P0-P3 tool-spec pass. It now pins T04-T09 and optional
+  T24/T25 result lineage; constructs items deterministically from source IDs;
+  uses frame-primary ordering and real anchor frames for synthetic deadlines;
+  enforces the closed eight-label taxonomy; and hard-clamps model mode to 20,
+  failing rather than dropping mandatory candidate/checkpoint evidence. It
+  uses the shared authenticated cursor envelope with query/policy/revision/run
+  binding and publishes immutable per-query timeline/manifest artifacts with
+  validation invariants, issue codes, security/golden tests and a 22-step
+  checklist (V2-039/V2-044/V2-047 reconciliation).
 - **T11**: §5 eligibility now uses deferred `population_baselines` capability
   wording (no behavioral milestone-label switch); §7 rewritten lexicographic
   with audit-only score; §12/§24.3 milestone-label phrases replaced
@@ -274,19 +342,15 @@ Edits already applied in the current P1/P2 batch:
     `stage_timings`; output layout includes `profile_alternatives.jsonl` and
     `stage_timings.jsonl`; tests/acceptance mention alternatives/timings.
 - **tools/T08_find_pfcp_failures.md**
-  - Large partial rewrite: result now includes `association_observations` and
-    `session_reports`; new `PFCPAssociationObservation`,
-    `PFCPSessionReportObservation`, `TunnelRoleExpectation` models; sections
-    for association/node-state, Session Report handling, directional
-    consistency, persistence, tests and acceptance.
+  - The earlier partial rewrite has been completed through P3. Association /
+    node-state observations now live in a run-scoped catalog, attempt links are
+    causal and typed, Session Reports and directional tunnel checks have exact
+    algorithms, and persistence/tests/acceptance are reconciled.
 - **V2-027 cleanup files also remain modified:** T06/T07/T09/T11/T14 wording
   from the completed V2-027 visibility work.
 
 Known incomplete parts outside `architecture.md` and `LLD.md`:
 
-- T08 needs a careful consistency pass after the large section renumbering:
-  verify all internal section references, model imports, line wraps and
-  acceptance wording.
 - T22 still needs its concrete `NFReadinessSnapshot` schema updated to carry
   `requirements: list[ServiceRequirement]`, per-service aggregation details,
   missing/partial observations, tests and acceptance text. T24/T23 may need
@@ -296,8 +360,8 @@ Known incomplete parts outside `architecture.md` and `LLD.md`:
   summaries and ServiceRequirement readiness.
 - T21 should point at LLD §23.6 timing anchors/precision where it owns phase
   timing rows.
-- T07/T09/T05/T14 likely need smaller reachability/MT-delivery and timing
-  alignment, beyond the earlier V2-027 visibility edits.
+- T14 still needs smaller reachability/MT-delivery and timing alignment beyond
+  the earlier V2-027 visibility edits; T05/T07/T09 are now reconciled.
 - T11/T12 may need small wording so profile alternatives are never baseline
   or root-cause alternatives.
 - TODO completion state must stay unchanged until all the above are
@@ -330,8 +394,8 @@ Known incomplete parts outside `architecture.md` and `LLD.md`:
   shared provider abstraction, resource-profile hardware wording, T15
   mandatory-evidence guarantee and PFCP `unknown` versus diagnostic
   `inconclusive`. Remaining files and TODO boxes are still open.
-- `tools/T01_decode_capture.md` and `tools/T02_normalize_events.md` now have
-  P0-P3 passes. Continue tools file-by-file with T03 next unless the user
+- `tools/T01_decode_capture.md` through `tools/T10_get_attempt_timeline.md` now
+  have P0-P3 passes. Continue tools file-by-file with T11 next unless the user
   redirects.
 - Useful verification greps:
   `grep -rn "minimum_auto_link_confidence\|capture_phases:\|operation_policy_version\|cause_dictionary_version\|timeout_policy_version" tools/` (should only hit T11/T12/T21 for the resolver residual);
@@ -345,6 +409,5 @@ Known incomplete parts outside `architecture.md` and `LLD.md`:
 Task #1 (P0) complete. P1 is in progress with V2-018 through V2-027 complete.
 V2-028..V2-034 and P2 V2-035..V2-044 are complete only in architecture/LLD and
 remain unchecked. P3 V2-045..V2-053 is complete only in architecture/LLD and
-remains unchecked, with T01 additionally reconciled through P3. P4 remains
-pending. TODO synchronization is current for
-completed items.
+remains unchecked, with T01-T10 additionally reconciled through P3. P4
+remains pending. TODO synchronization is current for completed items.

@@ -39,9 +39,17 @@ Outputs:
 class SegmentAttemptsRequest(BaseModel):
     schema_version: Literal["2.0"] = "2.0"
     analysis_id: UUID
+    normalization: NormalizeEventsResult
+    identity_result: BuildIdentityGraphResult
     primary_reader: PrimaryEventReader
     identity_graph: IdentityGraphReader
+    capture: CaptureMetadata
     profile_registry: ResolvedProfileRegistry
+    run_dir: Path
+    attempts_dir: Path
+    indexes_dir: Path
+    enabled_capabilities: set[CapabilityName] = Field(default_factory=set)
+    policy_versions: dict[str, str]
     config: AttemptSegmentationConfig
 
 
@@ -50,26 +58,54 @@ class AttemptSegmentationConfig(BaseModel):
     default_response_timeout_seconds: Decimal = Decimal("10")
     max_open_attempts_per_ue: int = 100
     minimum_assignment_confidence: Decimal = Decimal("0.70")
+    profile_alternative_margin: Decimal = Decimal("0.10")
+    max_profile_candidates_per_trigger: int = 20
+    max_assignment_candidates_per_event: int = 20
+    max_issue_samples_per_code: int = 20
     persist_unassigned_events: bool = True
+    fsync_outputs: bool = True
 
 
 class SegmentAttemptsResult(BaseModel):
     schema_version: Literal["2.0"]
     analysis_id: UUID
     status: Literal["success", "partial", "failed"]
-    manifest: ArtifactDescriptor
     revision: str
+    manifest: ArtifactDescriptor
+    artifacts: list[ArtifactDescriptor]
+    collections: list[CollectionDescriptor] = Field(default_factory=list)
     attempt_count: int
     outcome_counts: dict[str, int]
     profile_counts: dict[str, int]
     ambiguous_assignment_count: int
     unassigned_event_count: int
-    warnings: list[AttemptWarning]
+    transition_count: int
+    retry_count: int
+    profile_alternative_count: int
+    stage_timing_count: int
+    warning_counts: dict[str, int]
+    elapsed_ms: int
+    issues: list[AttemptWarning]
 ```
 
 `revision` is the section 25 (`LLD.md`) revision envelope digest for this
 attempt generation; downstream consumers (T10/T11/T21 and lineage validation)
 reference attempts by this value.
+
+`AttemptWarning` is a type alias of shared `Issue`. T04 validates that the T02
+result/manifest/reader revision agree, the T03 result/manifest/reader revision
+agree, and the T03 parent revision is the same T02 generation supplied here.
+It rejects mixed analysis IDs, unsupported schemas and stale sibling readers.
+
+`capture` must match the T01/T02 source checksum and frame bounds. The resolved
+profile registry checksum, selected release/deployment overlays and visibility
+registry checksum must match `policy_versions`; T04 never loads profile YAML
+or selects a latest version itself.
+
+Paths must resolve inside the run root with `attempts_dir` at
+`normalized/attempts`. Absolute paths, traversal, symlink escape and staging /
+published aliases are fatal. Configuration requires positive timeouts/caps,
+thresholds in `[0,1]`, and a nonnegative alternative margin.
 
 ## 5. Procedure Attempt Model
 
@@ -95,6 +131,7 @@ class ProcedureAttempt(BaseModel):
     end_frame: int
     start_timestamp: Decimal | None
     end_timestamp: Decimal | None
+    incomplete_history: bool = False
     trigger_event_ids: list[UUID]
     event_ids: list[UUID]
     correlation_identifiers: EventIdentifiers
@@ -109,10 +146,43 @@ class ProcedureAttempt(BaseModel):
     assignment_confidence: Literal["high", "medium", "low"]
     visibility: InterfaceVisibility
     roaming_topology: RoamingTopologyInterval | None
-    warnings: list[str] = Field(default_factory=list)
+    issue_codes: list[str] = Field(default_factory=list)
 ```
 
 Open attempts are internal transient objects. A completed T04 artifact must not contain `outcome=open`.
+Persisted `issue_codes` contain registered issue codes only; human messages live
+in manifest/result `Issue` records. `event_ids`, trigger IDs, child IDs,
+transitions, retries, alternatives and timing rows have deterministic ordering
+and no duplicates.
+
+### 5.1 Assignment and relationship records
+
+```python
+class AttemptEventAssignment(BaseModel):
+    schema_version: Literal["2.0"] = "2.0"
+    assignment_id: UUID
+    event_id: UUID
+    attempt_id: UUID
+    confidence: Decimal
+    strength: Literal["exact", "strong", "supporting"]
+    reason_codes: list[str]
+    profile_stage_ids: list[str]
+    shared_by_nesting_rule: bool = False
+
+
+class AttemptRelationship(BaseModel):
+    relationship_id: UUID
+    left_attempt_id: UUID
+    right_attempt_id: UUID
+    relation: Literal["parent_child", "retry_of", "supersedes", "access_transfer"]
+    evidence_event_ids: list[UUID]
+    profile_rule_id: str
+```
+
+Every accepted event assignment has one record. A shared event has one record
+per legal owner and the same profile nesting rule. Ambiguous candidates use
+the section 17 model and never appear in an attempt's `event_ids` unless later
+accepted by deterministic disambiguation.
 
 ## 6. Procedure Profile Contract
 
@@ -185,6 +255,37 @@ An attempt opens only from a profile trigger with sufficient identity context. T
 
 If the capture starts mid-procedure, a profile may define a `mid_capture_trigger` such as a response or path-switch message. Such attempts are marked `incomplete_history=true` and cannot claim missing earlier stages.
 
+### 8.1 Profile candidate selection algorithm
+
+For each primary event in `(frame,event_id)` order:
+
+1. Resolve active T03 UE, access, session and topology intervals at the frame.
+2. Query
+   `profile_registry.candidates(message_type, procedure, access_family, release, deployment)`;
+   do not scan every profile.
+3. Evaluate trigger matchers and allowlisted condition facts. Unknown facts
+   remain unknown and cannot satisfy a required boolean condition.
+4. Build shared `ScoreTerm` rows from trigger specificity, identity/context
+   completeness, access-family match, release/deployment compatibility,
+   mid-capture penalty and conflicts. Clamp canonical-decimal confidence to
+   `[0,1]`.
+5. Sort by confidence descending, trigger specificity descending, profile ID
+   and profile checksum. Retain at most
+   `max_profile_candidates_per_trigger`; overflow of equal viable candidates
+   is persisted and marks partial rather than selecting by iteration order.
+6. Select the highest candidate. Candidates within
+   `profile_alternative_margin` remain `alternative`; impossible candidates
+   with useful audit evidence are `rejected`. Later terminal/stage evidence may
+   mark one `disambiguated`, but no record is deleted.
+7. Open an attempt only when the selected trigger is genuine and has a stable
+   UE/access/session context or a profile-authorized provisional mid-capture
+   basis.
+
+Selected profile identity is an attempt-ID input. Later disambiguation updates
+the alternatives/status evidence but does not silently change the selected
+profile or attempt ID; a materially different selected profile requires a new
+T04 revision.
+
 ## 9. Event Assignment
 
 Assignment order:
@@ -204,7 +305,33 @@ These records explain procedure ambiguity only; T17 renders them separately
 from T12 root-cause alternatives. Disambiguation never rewrites the attempt ID
 or silently removes rejected alternatives from the artifact.
 
-### 9.1 Access-scoped registration and non-merge rules
+### 9.1 Deterministic assignment algorithm
+
+For each event, build candidates only from open attempts indexed by T03 node
+IDs, protocol transaction identifiers and profile stage matchers:
+
+1. Reject attempts whose access/context/session validity cannot overlap the
+   event, except an explicit profile access-transfer/nesting rule.
+2. Score exact identity/transaction links, explicit parent references and
+   strong graph associations. Add bounded profile-stage/time/endpoint support
+   only after one stronger term exists.
+3. Reject a candidate with a hard transaction, access-family, closed-terminal
+   or identity conflict.
+4. Sort by confidence descending, strength, stage-order compatibility, attempt
+   start frame, profile ID and attempt UUID.
+5. Accept the top candidate when confidence is at least
+   `minimum_assignment_confidence` and either it is the sole top candidate or
+   all tied owners are permitted by one nesting rule.
+6. Persist other plausible candidates as ambiguous. Persist no-candidate or
+   below-threshold events as unassigned when configured.
+7. Cap only weak candidates deterministically. Explicit candidate overflow is
+   fatal; weak truncation emits `T04_ASSIGNMENT_CANDIDATES_TRUNCATED` and marks
+   the result partial.
+
+Assignment IDs are UUIDv5 over T04 revision, event ID, attempt ID and accepted
+rule IDs. Timestamp proximity alone never creates a candidate.
+
+### 9.2 Access-scoped registration and non-merge rules
 
 T04 reads the T03 `AccessContextKey` and `AccessRegistrationState` active at
 each event. Registration, service, deregistration and mobility state is keyed
@@ -249,6 +376,27 @@ A new attempt is required when any decisive condition holds:
 
 Repeated requests with ambiguous transaction information remain assignment candidates and lower attempt confidence; they are not blindly merged.
 
+### 10.1 Retry decision algorithm
+
+When a trigger matches an open attempt and could also start a new attempt,
+evaluate the profile retry rules before opening either path:
+
+1. Compare only the profile-declared stable request-signature fields.
+2. Require compatible T03 node validity and access context.
+3. Require the transaction identity relation declared by the retry rule
+   (`same`, `may_change`, or `must_change`).
+4. Compute frame/time distance using frame order as authoritative and valid
+   timestamps only as an additional bound.
+5. Reject retry classification after any terminal, superseding trigger,
+   context expiry or incompatible request field.
+6. If exactly one retry rule matches, append a deterministic `RetryRecord` and
+   assignment to the existing attempt. If multiple rules tie, persist the
+   ambiguity and open a new low-confidence attempt rather than merging.
+
+The retry record ID uses T04 revision, attempt ID, previous trigger event ID,
+new trigger event ID and retry rule ID. Retry classification never changes a
+closed attempt.
+
 ## 11. Parent and Child Attempts
 
 Nested examples:
@@ -272,7 +420,22 @@ For each assigned event:
 
 T04 records observed transitions. T09 later determines whether a missing transition is a diagnostic failure.
 
+Transition IDs are UUIDv5 over T04 revision, attempt ID, stage ID, occurrence,
+source event IDs and resulting state. For one attempt, transitions sort by
+frame, profile stage order, occurrence and transition ID. Repeatable stages
+increment occurrence; duplicate matching of the same event/stage is collapsed.
+An event that matches mutually exclusive branches produces a profile conflict
+issue and keeps both profile alternatives rather than choosing by matcher
+iteration order.
+
 ## 13. Attempt Closure
+
+Closure evaluation occurs after all events in a frame are assigned. For an
+attempt with several same-frame terminal matches, profile terminal precedence
+is `failure`, `abort`, then `success`, unless the profile declares an explicit
+rollback/supersession rule. Ties within one class sort by matcher ID and event
+ID. T04 persists all terminal evidence even when one terminal determines the
+outcome.
 
 ### 13.1 Success
 
@@ -298,6 +461,22 @@ Use `timed_out` only when:
 ### 13.5 Incomplete capture
 
 Use `incomplete_capture` when the capture starts after required history or ends before a reliable timeout/terminal conclusion.
+
+### 13.6 Stage timing construction
+
+T04 emits shared `StageTimingObservation` rows for:
+
+- `attempt.trigger` from the accepted trigger or mid-capture basis.
+- `request.first_ue_or_network_message` from the first assigned initiating
+  event.
+- Profile-owned observed stage anchors.
+- `terminal.outcome` from the selected terminal, timeout deadline or capture
+  boundary.
+
+Frames are primary. Decimal timestamps and source precision are copied only
+from validated events; generated deadlines use canonical decimal arithmetic.
+`not_applicable`, `absent` and `inconclusive` follow LLD section 23.6. T04 does
+not emit detector-owned dependency/PFCP/missing/recovery timings.
 
 ## 14. Visibility Model
 
@@ -339,20 +518,33 @@ Dynamic frames, timestamps, stream IDs, sequence numbers, SEIDs, TEIDs, UUIDs, a
 Attempt IDs are deterministic UUIDv5 values derived from:
 
 ```text
-analysis_id + profile_id + stable UE/context node + first trigger event ID
+analysis_id + t03_revision + profile_registry.sha256 + profile_id
++ stable UE/access/session context key + first trigger event ID
 ```
 
-Sequence numbers are assigned per UE and procedure type by start frame. Adding later events to an attempt does not change its ID or sequence.
+The stable context key uses the most specific available T03 node IDs in order:
+UE, access context, session; a provisional mid-capture key uses the trigger
+event ID and profile-authorized visible identifiers. Adding later events does
+not change the attempt ID.
+
+Sequence numbers are assigned after all attempts are materialized, partitioned
+by `(ue_id or provisional_context_key, procedure_type)`, and sorted by
+`start_frame`, trigger event ID and attempt UUID. Adding later events to an
+existing attempt does not change its sequence. A new earlier attempt in a new
+T04 revision may renumber later attempts; consumers pin the revision.
 
 ## 17. Ambiguous and Unassigned Events
 
 ```python
 class AttemptAssignmentCandidate(BaseModel):
+    schema_version: Literal["2.0"] = "2.0"
+    candidate_id: UUID
     event_id: UUID
     candidate_attempt_id: UUID
     confidence: Decimal
+    score_terms: list[ScoreTerm]
     reason_codes: list[str]
-    accepted: bool
+    decision: Literal["ambiguous", "rejected"]
 ```
 
 Events below assignment threshold are persisted as unassigned. Ambiguous assignment must remain visible to diagnostics and reports as a limitation.
@@ -365,6 +557,7 @@ normalized/attempts/
   transitions.jsonl
   retries.jsonl
   event_assignments.jsonl
+  attempt_relationships.jsonl
   ambiguous_assignments.jsonl
   unassigned_events.jsonl
   profile_alternatives.jsonl
@@ -375,7 +568,28 @@ indexes/
   ue_attempt_index.jsonl
   event_attempt_index.jsonl
   procedure_attempt_index.jsonl
+staging/T04-<uuid>/
 ```
+
+All files exist even when empty. Attempts sort by start frame, trigger event
+ID and attempt UUID. Child files sort by attempt ID then their semantic frame /
+occurrence/UUID order. Index entries include T04 revision and byte offsets and
+must support bounded lookup by attempt, UE, access context, session, event,
+procedure/profile and outcome.
+
+### 18.1 Artifact descriptor expectations
+
+Every listed data/index/manifest file has a shared `ArtifactDescriptor` with
+run-relative path, artifact/media/schema type, SHA-256, byte size, verifiable
+record count, `creation_stage="T04"`, T03 manifest checksum as parent source,
+and T04 revision. Required artifact types are `procedure_attempts`,
+`attempt_transitions`, `attempt_retries`, `attempt_event_assignments`,
+`attempt_relationships`, `attempt_assignment_candidates`,
+`attempt_unassigned_events`, `profile_selection_alternatives`,
+`stage_timing_observations`, `attempt_index`, and `attempts_manifest`.
+
+The run-store artifact registrar adds descriptors to the canonical artifact
+index. T04 never overwrites the shared artifact index directly.
 
 ## 19. Manifest and Revisioning
 
@@ -386,14 +600,103 @@ observability timing coverage, artifacts, elapsed time, and warnings.
 
 Changing profiles or timeout configuration creates a new immutable attempt revision.
 
+The manifest has `schema_version`, `tool="T04"`, analysis ID, status, T04
+revision, T02/T03 parent revisions and manifest checksums, profile/visibility
+registry identities, selected release/deployment, config hash, counts,
+artifacts/collections, sampled issues and timing/peak RSS. Counts include
+attempts, transitions, retries, assignments, relationships, ambiguous and
+unassigned events, alternatives by status, stage timings by status,
+provisional/incomplete attempts and warning codes.
+
+T04 revision inputs are T02/T03 revisions and manifest checksums, capture
+bounds/source checksum, profile/visibility registry checksums, selected
+release/deployment overlays, canonical config, enabled behavior capabilities,
+tool version and schema version. Runtime timestamps, elapsed time and output
+checksums are not recursive revision inputs.
+
+### 19.1 Runner blueprint
+
+```python
+def segment_attempts(req: SegmentAttemptsRequest) -> SegmentAttemptsResult:
+    parent = validate_t02_t03_lineage(req)
+    profiles = validate_profile_registry(req.profile_registry, req.policy_versions)
+    validate_paths_and_capture(req, parent)
+    revision = build_t04_revision(req, parent, profiles)
+    existing = inspect_existing_attempts(req.run_dir, revision)
+    if existing:
+        return result_from_manifest(existing)
+
+    staging = make_unique_staging_dir(req.run_dir / "staging", prefix="T04-")
+    state = AttemptEngineState(revision=revision, profiles=profiles, config=req.config)
+    writers = open_attempt_writers(staging)
+    indexes = open_attempt_indexes(staging)
+    issues: list[Issue] = []
+
+    for frame_events in iter_primary_frame_batches(req.primary_reader, req.capture):
+        validate_primary_batch(frame_events, parent.t02)
+        identities = req.identity_graph.resolve_batch(frame_events)
+        state.close_expired_before(frame_events[0].frame, writers, issues)
+        state.process_frame(frame_events, identities, writers, issues)
+
+    state.close_at_capture_end(req.capture, writers, issues)
+    attempts = state.materialize_attempts_and_sequences()
+    writers.write_final_attempt_records(attempts, state)
+    indexes.build(attempts, state)
+    close_flush_fsync(writers, indexes, enabled=req.config.fsync_outputs)
+    counters = validate_staged_attempts(staging, attempts, state)
+    descriptors = build_t04_descriptors(staging, counters, revision, parent)
+    manifest = build_attempts_manifest(req, parent, profiles, revision,
+                                       descriptors, counters, issues)
+    validate_attempts_manifest(manifest, descriptors, counters)
+    publish_staged_attempts(staging, manifest_last=True)
+    return result_from_manifest(manifest)
+```
+
+Frame processing order is: resolve identity/profile trigger candidates; assign
+non-trigger events; classify retry/new attempts; open attempts; append stage
+transitions; evaluate same-frame terminals; update visibility/state. No thread
+completion order may affect persisted ordering.
+
+### 19.2 Publication invariants
+
+Before publication T04 proves:
+
+- Unique attempt, assignment, relationship, transition, retry, alternative and
+  timing IDs.
+- Every attempt has a genuine trigger/mid-capture basis and at least one event.
+- Every event ID resolves to a primary T02 event and same-lineage T03 context.
+- Every accepted assignment references one existing attempt/event; sharing is
+  permitted by a persisted nesting rule.
+- Attempt event lists equal accepted assignment projections and are ordered /
+  duplicate-free.
+- Parent/child/retry/transfer references are reciprocal, acyclic where
+  required, and do not cross incompatible access contexts.
+- Closed attempts never absorb later events; outcomes are terminal and bounds
+  cover all assigned events.
+- Sequence numbers are contiguous within each partition key.
+- Alternatives contain exactly one selected profile and preserve all retained
+  statuses/evidence.
+- Timing/status semantics and visibility namespaces validate against shared
+  models and the resolved registry.
+- Every index entry resolves to a same-revision record/offset; descriptors and
+  manifest counts match staged bytes.
+
 ## 20. Failure Semantics
 
 - Invalid T02/T03 manifest: fatal.
+- Mixed/stale T02-T03-reader lineage, incompatible profile registry or path
+  escape: fatal.
 - Unknown procedure trigger: create `unknown_procedure` only when a genuine trigger exists; warn.
 - Maximum open-attempt limit exceeded: stop opening low-confidence attempts, mark partial, preserve events.
 - Ambiguous assignment: nonfatal, persisted.
 - Profile invariant or impossible terminal transition: warn/quarantine attempt; fatal only if output consistency cannot be maintained.
 - Index/data mismatch or publication failure: fatal.
+
+Ambiguity, profile alternatives, provisional starts and incomplete capture are
+represented outcomes and do not alone make status partial. Status is partial
+only when information is discarded or quarantined, such as weak candidate
+truncation, open-attempt cap suppression or a recoverable malformed event.
+Fatal errors publish no T04 manifest and leave prior revisions unchanged.
 
 ## 21. Performance and Resource Requirements
 
@@ -420,6 +723,15 @@ Structured logs:
 - Outcome, completion reason, warning code, duration.
 
 Metrics include attempts by profile/outcome, retry counts, timeout/incomplete counts, ambiguous assignment rate, and open-attempt high-water mark.
+
+Minimum registered T04 issue codes are
+`T04_UNKNOWN_PROCEDURE_TRIGGER`, `T04_PROFILE_AMBIGUOUS`,
+`T04_ASSIGNMENT_AMBIGUOUS`, `T04_ASSIGNMENT_CANDIDATES_TRUNCATED`,
+`T04_OPEN_ATTEMPT_LIMIT`, `T04_PROFILE_INVARIANT`,
+`T04_TERMINAL_CONFLICT`, `T04_EVENT_QUARANTINED` and
+`T04_OUTPUT_INVARIANT_FAILED`. Shared access/evidence violations use
+`RUN_ACCESS_BOUNDARY` and `RUN_EVIDENCE_INTEGRITY`. Logs/issues never include
+clear identifiers or request bodies.
 
 ## 24. Proposed Python Code Structure
 
@@ -475,6 +787,11 @@ V2/harness/models/
 - Profile alternatives with selected/rejected/disambiguated status and stable
   evidence.
 - Stage timing rows for trigger, terminal and profile-owned anchors.
+- Profile candidate scoring/margin/cap and stable tie ordering.
+- Event assignment score terms, nesting sharing and weak/explicit cap behavior.
+- Same-frame trigger/assignment/terminal ordering.
+- Sequence assignment after materialization.
+- Revision, descriptor, manifest and issue-code validation.
 
 ### 26.2 Integration tests
 
@@ -493,6 +810,10 @@ V2/harness/models/
   disambiguates them.
 - Capture starting/ending mid-attempt.
 - Missing reference-point/SBI visibility.
+- Identical rerun returns the same revision; changed profile/config creates a
+  sibling generation.
+- Crash before manifest publication leaves no readable T04 result and preserves
+  the prior revision.
 
 ### 26.3 Negative tests
 
@@ -500,6 +821,22 @@ V2/harness/models/
 - Timestamp overlap alone does not assign an event.
 - Closed attempt does not absorb a new trigger.
 - Primary segmentation cannot access NRF/UDR readers.
+- Mixed T02/T03 revisions, stale graph reader, corrupt descriptor, executable
+  profile predicate, symlink escape and unresolved output invariant fail
+  without a T04 manifest.
+- Clear subscriber values do not appear in attempts, indexes, manifest, issues
+  or logs.
+
+### 26.4 Golden tests
+
+- A fixed capture produces byte-stable attempts, assignments, alternatives,
+  transitions, retries, relationships, timings and indexes after normalizing
+  generated timing fields only.
+- Golden coverage includes retries/new attempts, reused PDU session IDs,
+  overlapping UEs, concurrent access families, one ambiguous assignment,
+  timeout versus incomplete capture and roaming topology attachment.
+- Reader/index lookups by attempt, UE, event, access context, session,
+  procedure/profile and outcome return expected same-revision records.
 
 ## 27. Acceptance Criteria
 
@@ -517,3 +854,47 @@ T04 is complete when:
 10. Attempt IDs and sequence numbers are deterministic.
 11. Supported scenario families have versioned profiles and fixture coverage.
 12. Primary-only data access is enforced.
+13. Every published record/index/descriptor satisfies section 19.2 and the
+    manifest is published last.
+14. T04 mints a deterministic immutable revision and never overwrites a
+    sibling generation.
+
+## 28. Mechanical Implementation Checklist
+
+1. Import shared models and define the section 4/5 record schemas without
+   local warning, descriptor, revision or visibility duplicates.
+2. Register all T04/RUN issue codes used by the tool.
+3. Validate config thresholds, positive bounds and candidate/open-attempt caps.
+4. Validate run-relative paths and create `staging/T04-<uuid>/` only.
+5. Validate T02/T03 manifests, reader revisions, analysis IDs and parent
+   lineage.
+6. Validate capture checksum/bounds and resolved profile/visibility registry
+   compatibility/checksums.
+7. Build the T04 revision before deterministic child IDs and return an existing
+   identical generation when present.
+8. Implement bounded primary frame batching and same-revision T03 batch lookup.
+9. Implement indexed profile candidate lookup and section 8.1 scoring.
+10. Implement trigger/mid-capture validation and deterministic attempt IDs.
+11. Implement open-attempt indexes by UE/access/session/transaction/profile.
+12. Implement section 9.1 assignment scoring, ambiguity and cap behavior.
+13. Implement access-family separation and explicit transfer/nesting rules.
+14. Implement retry/new-attempt decisions and deterministic retry records.
+15. Implement stage transitions, occurrence ordering and branch conflicts.
+16. Implement terminal precedence, timeout/visibility and incomplete-capture
+    closure.
+17. Implement parent/child/supersedes/access-transfer relationships.
+18. Build stable request signatures excluding dynamic identifiers.
+19. Materialize profile alternatives and deterministic disambiguation statuses.
+20. Emit T04-owned stage timing rows with shared status/anchor semantics.
+21. Attach the exact T03 topology interval/revision active at the trigger.
+22. Close all attempts at terminal/timeout/capture end; persist no open outcome.
+23. Assign deterministic per-context/procedure sequence numbers.
+24. Write every data file, including empty files, in canonical order.
+25. Build attempt/UE/event/procedure indexes with revision and byte offsets.
+26. Flush/fsync and run every section 19.2 invariant against staged bytes.
+27. Build descriptors and register them through run-store artifact ownership.
+28. Build/validate the manifest with full counts and sampled issues.
+29. Publish data, indexes and manifest last; clean only this staging tree on
+    failure.
+30. Add unit, integration, negative/access-control and golden tests from
+    section 26.

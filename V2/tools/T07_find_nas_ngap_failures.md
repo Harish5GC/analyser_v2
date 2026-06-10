@@ -17,7 +17,7 @@ T07 must not:
   expected outcome is absent as a request-only observation/terminal-effect
   input for T09, never as its own candidate.
 - Read NRF/UDR partitions.
-- Decode encrypted NAS beyond fields exposed by T02/T18.
+- Decode encrypted NAS beyond fields exposed by T02.
 - Apply user scenario expectations.
 - Rank cross-protocol candidates.
 
@@ -32,7 +32,10 @@ Inputs:
   capture bounds, the T21 phase reader, reference-point/SBI visibility, assignment
   confidence and the resolved NAS/NGAP cause-dictionary handles.
 
-The detector may read exact full evidence through T18 for fields already referenced by assigned events, but cannot perform broad context lookup or re-decode.
+T07 consumes canonical T02 fields and source references only. It does not open
+retained decoder trees, perform broad context lookup or invoke T18/T20 during
+detection. Missing transfer/container semantics remain explicit partial
+evidence that T19/T20 may inspect later under their own capabilities.
 
 ## 4. Python Tool Contract
 
@@ -41,19 +44,53 @@ class FindNASNGAPFailuresRequest(BaseModel):
     schema_version: Literal["2.0"] = "2.0"
     analysis_id: UUID
     attempt: ProcedureAttempt
+    attempts_revision: str
+    primary_reader: PrimaryEventReader
     event_ids: list[UUID]
     profile: ProcedureProfile
     context: DetectionContext
+    run_dir: Path
+    diagnostics_dir: Path
+    max_issue_samples_per_code: int = 20
+    fsync_outputs: bool = True
 
 
 class FindNASNGAPFailuresResult(BaseModel):
     schema_version: Literal["2.0"]
+    analysis_id: UUID
     attempt_id: UUID
+    status: Literal["success", "partial", "failed"]
+    revision: str
+    manifest: ArtifactDescriptor
+    artifacts: list[ArtifactDescriptor]
     candidates: list[FailureCandidate]
     terminal_effects: list[TerminalEffect]
+    request_only_observations: list[RequestOnlyObservation]
     inspected_event_count: int
-    warnings: list[DetectorWarning]
+    warning_counts: dict[str, int]
+    elapsed_ms: int
+    issues: list[DetectorWarning]
 ```
+
+T07 validates analysis/attempt/profile identity, T04 revision, assigned event
+membership, `DetectionContext` IDs/bounds/phase revision and resolved cause /
+scoring policy checksums. The injected primary reader must be the T02 ancestor
+of the attempt. Output paths resolve to
+`normalized/diagnostics/<attempt-id>/T07`; traversal/symlink escape is fatal.
+
+```python
+class RequestOnlyObservation(BaseModel):
+    observation_id: UUID
+    attempt_id: UUID
+    event_id: UUID
+    expected_stage_ids: list[str]
+    frame: int
+    reason_codes: list[str]
+    evidence_ids: list[UUID]
+```
+
+These records carry initiating explicit evidence to T09. They are not failure
+candidates and never receive T09's implicit-absence score.
 
 ## 5. NAS Failure Observation
 
@@ -73,6 +110,13 @@ class NASFailureObserved(BaseModel):
 ```
 
 Cause dictionaries preserve numeric code, standardized label, standards release/profile, and source field path. Unknown causes remain numeric with `cause_name=UNKNOWN_<code>`.
+
+The resolved cause payload maps `(domain,message/procedure,cause)` to label,
+category, severity, detector base score, compatibility and source citation.
+Validation rejects duplicate/overlapping keys without explicit precedence,
+invalid code ranges, executable predicates and incompatible release/schema
+checksums. Unknown values use a registered generic rule without modifying the
+resolved dictionary.
 
 ## 6. NGAP Failure Observation
 
@@ -135,6 +179,28 @@ Detect:
 
 One NGAP message may contain successes and failures for different PDU sessions. Emit candidates scoped to failed item/session, not the whole UE attempt indiscriminately.
 
+### 8.1 Detection algorithm
+
+1. Load only assigned NAS/NGAP primary events in `(frame,event_id)` order and
+   validate their T02/T04 lineage.
+2. Project each event into the typed NAS or NGAP observation. Invalid optional
+   fields emit an issue; an explicit outer failure remains usable.
+3. Evaluate registered explicit detector rules in rule-ID order. T07 never
+   creates a candidate solely because a response/stage is absent.
+4. For NGAP list/transfer outcomes, expand one semantic item per failed
+   session/resource in source order, then sort by PDU session ID, QFI and
+   ordinal. Success items remain observations but create no failure candidate.
+5. Validate T03/T04 access/session association and profile stage. Reject hard
+   mismatches; apply a score penalty to low-confidence assignment.
+6. Build terminal effects and request-only observations independently from
+   candidate creation.
+7. Mint evidence, score terms and deterministic IDs, then classify phase,
+   relevance, cleanup and initial downstream metadata.
+
+Candidate IDs use T07 revision, attempt ID, rule ID, source event ID, failed
+item/session key and semantic ordinal. Item expansion never treats one failed
+resource as failure of every session in the message.
+
 ## 9. Resource Item Scoping
 
 For NGAP lists/transfers:
@@ -150,8 +216,9 @@ QFI/resource failures are associated only when the source IE explicitly links th
 
 ```python
 class TerminalEffect(BaseModel):
+    terminal_effect_id: UUID
     event_id: UUID
-    candidate_id: UUID
+    candidate_id: UUID | None
     effect_type: Literal[
         "UE_REJECT", "NGAP_UNSUCCESSFUL", "CONTEXT_RELEASE", "DEREGISTRATION"
     ]
@@ -159,7 +226,12 @@ class TerminalEffect(BaseModel):
     frame: int
     downstream_possible: bool
     correlation_keys: dict[str, str]
+    evidence_ids: list[UUID]
 ```
+
+Correlation keys contain only masked/scoped aliases. Request-only observations
+may have terminal metadata without a candidate ID; terminal effects tied to an
+explicit failure reference that candidate.
 
 NAS reject and NGAP unsuccessful outcome are strong terminal evidence. They remain eligible candidates but are tagged so T12 can demote them when an earlier supported cause explains them.
 
@@ -234,9 +306,17 @@ table, resolves `capture_phase` through `context.phase_reader`, publishes
 `call_impact="inconclusive"`, and mints cited evidence through the evidence
 registry (`LLD.md` section 24). Published candidates are immutable.
 
+For each explicit rule hit, T07 mints a `nas_failure`, `ngap_failure`,
+`ngap_resource_failure` or `terminal_effect` evidence record from sorted source
+events/refs and T07 revision. Score is the canonical-decimal sum of one base
+term and named cause/explicitness/assignment/visibility/capture/downstream /
+cleanup terms, clamped to `[0,1]`. Candidate order is frame, profile stage
+order, failed item key, rule priority and UUID. Every evidence ID must resolve
+through T18 before T15 in provider-none runs.
+
 ## 17. Cause Dictionary Management
 
-Cause tables are data files, not hard-coded switch statements where avoidable:
+Cause tables are resolver-owned data files, not detector-loaded switches:
 
 ```text
 V2/harness/config/causes/
@@ -249,34 +329,76 @@ Each entry records code/value, label, category, applicable message/procedure, st
 
 Unknown values must not fail detection.
 
+T07 reads immutable cause handles from `context.policies`; it never opens these
+paths or refreshes dictionaries mid-run.
+
 ## 18. Persistence and IDs
 
-Candidates use deterministic UUIDv5 from attempt ID + detector rule + source event + failed item/session ordinal.
-
-Common candidate storage is used:
+T07 publishes one immutable per-attempt detector generation:
 
 ```text
-normalized/diagnostics/failure_candidates.jsonl
-normalized/diagnostics/terminal_effects.jsonl
+normalized/diagnostics/<attempt-id>/T07/
+  failure_candidates.jsonl
+  terminal_effects.jsonl
+  request_only_observations.jsonl
+  nas_ngap_failures_manifest.json
+staging/T07-<attempt-id>-<uuid>/
 ```
+
+The common diagnostic aggregator consumes descriptors after T06-T08 finish;
+parallel detectors never append to shared files.
+
+T07 revision inputs are T04/attempt payload revision, assigned event IDs/T02
+revision, profile ID/checksum, T21 phase revision, detection visibility /
+assignment confidence, cause/scoring policy checksums, tool/schema version and
+output-affecting limits. Descriptors have types `nas_ngap_failure_candidates`,
+`terminal_effects`, `request_only_observations` and
+`nas_ngap_failures_manifest`, verifiable counts, T04 parent checksum and T07
+revision. Empty JSONL files are published.
+
+### 18.1 Runner and publication invariants
+
+The runner validates lineage/policies/paths, returns an existing identical
+revision when present, stages under `staging/T07-*`, loads assigned events,
+projects observations, expands failed resource items, evaluates explicit
+rules, mints evidence, writes outputs/descriptors/manifest, validates, and
+publishes the manifest last.
+
+Before publication prove unique candidate/effect/request-observation IDs;
+assigned-primary membership; one failed-item candidate per semantic item;
+terminal references and masked correlation keys; no implicit-absence candidate;
+score=sum(terms), phase/severity/relevance ownership and inconclusive call
+impact; evidence resolution; canonical ordering; descriptor/count/checksum
+agreement; and no clear identity/location/payload data.
 
 ## 19. Failure Semantics
 
 - Unknown attempt/event: validation error.
 - Event outside primary partition: reject.
+- Mixed/stale T02/T04/T21 lineage, incompatible profile/cause policy or path
+  escape: fatal with no T07 manifest.
 - Unsupported NAS/NGAP message: warn and continue.
 - Unknown cause: preserve numeric/raw cause and continue.
 - Transfer/container decode missing: partial candidate if outer failure is explicit.
-- Missing full evidence reference: evidence-integrity warning and lower confidence.
+- Missing/corrupt source reference: evidence-integrity warning and lower
+  confidence when explicit normalized evidence remains; fatal when evidence
+  identity cannot be resolved consistently.
 - Rule exception for one event: quarantine event and mark detector partial.
+
+Unknown causes, encrypted NAS with usable outer NGAP failure, request-only
+observations and represented ambiguity are valid results. Partial means an
+event/item was skipped or evidence was lost. Fatal errors preserve prior
+revisions and publish no manifest.
 
 ## 20. Performance and Resource Requirements
 
 - O(NAS+NGAP events in attempt).
 - No full-capture scans.
 - Decode cause tables once per process/version.
-- Materialize full containers only through bounded T18 lookup.
-- Record events/sec, candidates, item-level failures, unknown causes, full lookups, and elapsed time.
+- Do not materialize full containers. Preserve partial outer evidence and
+  source refs for later authorized T19/T20 inspection.
+- Record events/sec, candidates, item-level failures, unknown causes, partial
+  containers and elapsed time.
 
 ## 21. Security and Privacy
 
@@ -285,12 +407,20 @@ normalized/diagnostics/terminal_effects.jsonl
 - Candidate summaries use masked UE/session identifiers.
 - Treat cause/detail strings as untrusted.
 - Full NAS trees remain local and are not automatically model evidence.
+- T07 has no evidence-browsing or dependency capability; emitted evidence can
+  cite only assigned primary source events/refs.
 
 ## 22. Observability
 
 Logs include attempt, profile, event/candidate ID, message/procedure, cause code category, terminal-effect flag, and warning code.
 
 Metrics include NAS rejects by type/category, NGAP unsuccessful outcomes, resource-item failures, terminal effects, encrypted/partial NAS, unknown causes, and latency.
+
+Minimum registered codes are `T07_UNSUPPORTED_MESSAGE`, `T07_UNKNOWN_CAUSE`,
+`T07_PARTIAL_CONTAINER`, `T07_MIXED_RESOURCE_OUTCOME`,
+`T07_ASSIGNMENT_AMBIGUOUS`, `T07_EVENT_QUARANTINED` and
+`T07_OUTPUT_INVARIANT_FAILED`; shared access/evidence violations use
+`RUN_ACCESS_BOUNDARY` and `RUN_EVIDENCE_INTEGRITY`.
 
 ## 23. Proposed Python Code Structure
 
@@ -321,7 +451,7 @@ V2/harness/models/
 4. Add item-level PDU resource extraction.
 5. Add release/deregistration and downstream metadata.
 6. Add mobility/handover branches and visibility handling.
-7. Add full-evidence fallback and compatibility fixtures.
+7. Add deterministic evidence/persistence, compatibility and security fixtures.
 
 ## 25. Tests
 
@@ -334,6 +464,9 @@ V2/harness/models/
 - Terminal-effect tagging and deterministic candidate IDs.
 - Visibility/encryption behavior.
 - Cause dictionary versioning.
+- Item expansion ordering/deduplication and request-only observation behavior.
+- Score/evidence/candidate/effect/revision determinism.
+- Resolved cause-policy rejection and descriptor/manifest validation.
 
 ### 25.2 Integration tests
 
@@ -345,6 +478,10 @@ V2/harness/models/
 - N2 preparation/execution failure and successful rollback.
 - Inter-AMF context mapping and failure.
 - Encrypted NAS with explicit NGAP failure.
+- T09 consumes request-only observations without duplicate T07 candidates.
+- T18 resolves every emitted evidence ID before T15 in provider-none mode.
+- Identical rerun returns the same revision; cause/profile/context change
+  creates a sibling.
 
 ### 25.3 Negative tests
 
@@ -352,6 +489,18 @@ V2/harness/models/
 - Successful rollback is not primary failure.
 - Failure for one PDU session does not mark another failed session.
 - T07 cannot access NRF/UDR partitions.
+- Missing expected response/stage alone never creates a T07 candidate.
+- Stale attempt/phase revision, unassigned event, corrupt descriptor,
+  executable cause policy and symlink escape publish no manifest.
+- Clear identities/location/container payloads do not appear in outputs/issues/logs.
+
+### 25.4 Golden tests
+
+- Byte-stable candidates, effects, request-only observations, evidence IDs,
+  descriptors and manifest for NAS reject, NGAP item failure, handover failure,
+  encrypted NAS/outer failure and mixed-resource fixtures.
+- Golden normalization removes generated timings only, preserving frames,
+  causes, item scope, scores, phase/relevance and evidence IDs.
 
 ## 26. Acceptance Criteria
 
@@ -365,3 +514,32 @@ T07 is complete when:
 6. Mobility preparation, execution, path switch, and rollback are distinguished.
 7. Cause dictionaries are versioned and unknown values remain usable.
 8. Primary-only access is enforced.
+9. T07 emits no implicit-absence candidate and provides deterministic
+   request-only observations for T09.
+10. Every evidence/artifact passes section 18.1 and per-attempt output is safe
+    under parallel T06-T08 execution.
+
+## 27. Mechanical Implementation Checklist
+
+1. Define request/result/NAS/NGAP/effect/request-only models with shared types.
+2. Register T07 issue and evidence record types.
+3. Validate attempt/profile/context IDs, T02/T04/T21 lineage and assignments.
+4. Validate per-attempt T07 paths and create staging only.
+5. Validate resolved NAS 5GMM/5GSM, NGAP and scoring policy payloads.
+6. Build T07 revision and return an existing identical generation when valid.
+7. Load only assigned primary NAS/NGAP events in deterministic order.
+8. Project typed observations while preserving unknown numeric causes.
+9. Evaluate explicit NAS rules only; create request-only rows for absent-outcome
+   inputs rather than failure candidates.
+10. Evaluate explicit NGAP unsuccessful/error/non-delivery rules.
+11. Expand resource lists into correctly scoped failed items.
+12. Validate T03/T04 identity/session/access/profile-stage association.
+13. Build terminal effects and initial downstream/cleanup metadata.
+14. Build canonical score terms, severity, phase, relevance and call impact.
+15. Mint deterministic candidates/evidence/effects/request observations.
+16. Write all JSONL files including empty outputs.
+17. Validate membership, item scoping, no implicit candidates, privacy,
+   evidence, descriptors and counts.
+18. Build manifest with lineage/policy identities and sampled issues.
+19. Publish evidence/data then manifest last; preserve sibling generations.
+20. Add unit/integration/negative/security/golden tests from section 25.
