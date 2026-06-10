@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+tools/5g_call
+tools/5gcall
+tools/decoder/5g_call
+tools/decoder/5gcall
