@@ -1,6 +1,9 @@
 """T03 build_identity_graph implementation."""
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -9,7 +12,7 @@ from pathlib import Path
 from typing import Any, DefaultDict, Iterable, Iterator, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from harness.decoder.manifest import ArtifactDescriptor, CollectionDescriptor
 from harness.normalize import JsonlPrimaryEventReader, NormalizeEventsResult
@@ -63,6 +66,7 @@ class BuildIdentityGraphRequest(BaseModel):
     identity_rules: ResolvedPolicy
     topology_rules: ResolvedPolicy
     masking_policy: ResolvedPolicy
+    masking_key: SecretStr | None = Field(default=None, exclude=True)
     enabled_capabilities: set[str] = Field(default_factory=set)
     policy_versions: dict[str, str] = Field(default_factory=dict)
     config: IdentityGraphConfig = Field(default_factory=IdentityGraphConfig)
@@ -318,8 +322,8 @@ def build_identity_graph(request: BuildIdentityGraphRequest) -> BuildIdentityGra
     }
     issues: list[Issue] = []
 
-    salt = str((request.masking_policy.payload or {}).get("salt") or "")
-    observations = _extract_observations(request, salt, counters, issues)
+    lookup_key = _resolve_masking_key(request)
+    observations = _extract_observations(request, lookup_key, counters, issues)
     for observation in observations:
         observation_writer.write(observation)
 
@@ -331,6 +335,7 @@ def build_identity_graph(request: BuildIdentityGraphRequest) -> BuildIdentityGra
 
     registration_states = _build_registration_states(request, observations, nodes)
     topology_records, fault_domain_maps = _build_topology_records(request, nodes)
+    _validate_topology_bounds(request, topology_records, fault_domain_maps)
 
     for node in nodes:
         node_writer.write(node)
@@ -487,13 +492,26 @@ def build_identity_graph(request: BuildIdentityGraphRequest) -> BuildIdentityGra
     )
 
 
+def _resolve_masking_key(request: BuildIdentityGraphRequest) -> str:
+    raw_key = request.masking_key.get_secret_value() if request.masking_key is not None else None
+    key_env = (request.masking_policy.payload or {}).get("key_env")
+    if raw_key is None and key_env:
+        raw_key = os.environ.get(str(key_env))
+    if not raw_key:
+        raise ValueError("resolved masking key material is required")
+    return hmac.new(
+        raw_key.encode("utf-8"),
+        str(request.analysis_id).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def _validate_identity_request(request: BuildIdentityGraphRequest) -> None:
     if request.primary_reader.revision != request.normalization.revision:
         raise ValueError("primary reader revision does not match normalization revision")
     if request.capture.source_sha256 != request.normalization.manifest.parent_source_sha256:
         raise ValueError("capture source checksum does not match normalization lineage")
-    if not ((request.masking_policy.payload or {}).get("salt")):
-        raise ValueError("masking policy must provide payload.salt")
+    _resolve_masking_key(request)
     for key, policy in (
         ("identity_rules", request.identity_rules),
         ("topology_rules", request.topology_rules),
@@ -510,7 +528,7 @@ def _validate_identity_request(request: BuildIdentityGraphRequest) -> None:
 
 def _extract_observations(
     request: BuildIdentityGraphRequest,
-    salt: str,
+    lookup_key: str,
     counters: dict[str, Any],
     issues: list[Issue],
 ) -> list[IdentifierObservation]:
@@ -523,7 +541,7 @@ def _extract_observations(
         for field_name, value in event.identifiers.model_dump(exclude_none=True).items():
             node_type, role = _kind_mapping(field_name)
             sensitive = field_name in sensitive_kinds
-            lookup_value = mask_identifier(field_name, str(value), salt) if sensitive else str(value)
+            lookup_value = mask_identifier(field_name, str(value), lookup_key) if sensitive else str(value)
             scope_key = _scope_key(event, field_name)
             dedupe_key = (event.event_id, field_name, lookup_value)
             if dedupe_key in seen:
@@ -578,8 +596,14 @@ def _kind_mapping(kind: str) -> tuple[IdentityNodeType, IdentityObservationRole]
 
 
 def _scope_key(event: CanonicalEvent, kind: str) -> str:
-    del event
-    return f"{kind}:global"
+    if kind in {"supi", "suci", "gpsi", "guti", "pei"}:
+        return f"{kind}:subscriber"
+    access_key = event.identifiers.amf_ue_ngap_id or event.identifiers.ran_ue_ngap_id
+    if kind in {"amf_ue_ngap_id", "ran_ue_ngap_id"}:
+        return f"{kind}:{event.src.ip if event.src else 'unknown'}:{event.dst.ip if event.dst else 'unknown'}"
+    if kind in {"pdu_session_id", "procedure_transaction_id", "sm_context_ref"}:
+        return f"{kind}:access:{access_key or 'unknown'}"
+    return f"{kind}:frame:{event.frame}"
 
 
 def _build_edges(
@@ -629,7 +653,53 @@ def _build_edges(
                     issues.append(Issue(code="T03_WARNING_BAND_LINK", stage="T03", message=f"warning-band association edge for event {event_id}"))
                 accepted.append(edge)
 
+    conflicts.extend(_detect_identifier_conflicts(request, by_event, counters, issues))
     return accepted, ambiguous, conflicts
+
+
+def _detect_identifier_conflicts(
+    request: BuildIdentityGraphRequest,
+    by_event: dict[UUID, list[IdentifierObservation]],
+    counters: dict[str, Any],
+    issues: list[Issue],
+) -> list[IdentityConflict]:
+    bindings: DefaultDict[tuple[str, str, str, str], list[tuple[IdentifierObservation, IdentifierObservation]]] = defaultdict(list)
+    for event_id in sorted(by_event, key=str):
+        group = by_event[event_id]
+        access_observations = [item for item in group if item.node_type == "ACCESS_CONTEXT"]
+        ue_observations = [item for item in group if item.node_type == "UE"]
+        for access in access_observations:
+            for ue in ue_observations:
+                bindings[(access.kind, access.lookup_value, access.scope_key, ue.kind)].append((access, ue))
+
+    conflicts: list[IdentityConflict] = []
+    for key, pairs in sorted(bindings.items()):
+        ue_values = {ue.lookup_value for _, ue in pairs}
+        if len(ue_values) < 2:
+            continue
+        observations = sorted(
+            {item.observation_id: item for pair in pairs for item in pair}.values(),
+            key=lambda item: (item.frame, str(item.observation_id)),
+        )
+        conflict = IdentityConflict(
+            conflict_id=deterministic_uuid(request.analysis_id, request.normalization.revision, "identifier_conflict", *key),
+            code="T03_CONFLICTING_IDENTIFIER_BINDING",
+            observation_ids=[item.observation_id for item in observations],
+            frames=sorted({item.frame for item in observations}),
+            resolution="unresolved",
+            reason_codes=["same_scoped_access_identifier_multiple_subscriber_values"],
+            evidence_event_ids=sorted({item.event_id for item in observations}, key=str),
+        )
+        conflicts.append(conflict)
+        counters["warning_counts"][conflict.code] += 1
+        issues.append(
+            Issue(
+                code=conflict.code,
+                stage="T03",
+                message=f"scoped access identifier {key[0]} maps to multiple {key[3]} values",
+            )
+        )
+    return conflicts
 
 
 def _make_edge(
@@ -818,6 +888,20 @@ def _build_topology_records(
         )
         fault_domain_maps.append(fault_domain)
     return topology, fault_domain_maps
+
+
+def _validate_topology_bounds(
+    request: BuildIdentityGraphRequest,
+    topology: list[RoamingTopologyInterval],
+    fault_domains: list[FaultDomainMap],
+) -> None:
+    for record in [*topology, *fault_domains]:
+        if record.valid_from_frame < request.capture.first_frame:
+            raise ValueError("topology interval starts before capture")
+        if record.valid_to_frame is not None and record.valid_to_frame > request.capture.last_frame:
+            raise ValueError("topology interval ends after capture")
+        if record.valid_to_frame is not None and record.valid_from_frame > record.valid_to_frame:
+            raise ValueError("topology interval has reversed bounds")
 
 
 def _build_indexes(

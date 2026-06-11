@@ -3,9 +3,15 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from decimal import Decimal
+from uuid import UUID
 from uuid import uuid4
+
+from pydantic import SecretStr
 
 from harness.decoder.manifest import (
     ArtifactDescriptor,
@@ -17,9 +23,33 @@ from harness.decoder.manifest import (
     ProtocolDecodeResult,
 )
 from harness.decoder.runner import DecodeCaptureResult
-from harness.identity import BuildIdentityGraphRequest, build_identity_graph
-from harness.normalize import NormalizeEventsRequest, normalize_events, open_primary_event_reader
-from harness.shared import CaptureMetadata, ProtocolCodepointRegistry, ResolvedPolicy, sha256_file
+from harness.identity import (
+    BuildIdentityGraphRequest,
+    IdentifierObservation,
+    _detect_identifier_conflicts,
+    _resolve_masking_key,
+    _scope_key,
+    build_identity_graph,
+)
+from harness.normalize import (
+    NormalizationConfig,
+    NormalizeEventsRequest,
+    _iter_jsonl_isolated,
+    _normalized_headers,
+    normalize_events,
+    open_primary_event_reader,
+)
+from harness.shared import (
+    CanonicalEvent,
+    CaptureMetadata,
+    Endpoint,
+    EventIdentifiers,
+    Issue,
+    ProtocolCodepointRegistry,
+    ResolvedPolicy,
+    deterministic_uuid,
+    sha256_file,
+)
 
 
 class NormalizeAndIdentityGraphTests(unittest.TestCase):
@@ -102,8 +132,9 @@ class NormalizeAndIdentityGraphTests(unittest.TestCase):
                         name="masking-policy",
                         version="2026-06-10",
                         sha256="masking-sha",
-                        payload={"salt": "unit-test-salt"},
+                        payload={},
                     ),
+                    masking_key="unit-test-key",
                     policy_versions={
                         "identity_rules": "2026-06-10",
                         "topology_rules": "2026-06-10",
@@ -116,10 +147,148 @@ class NormalizeAndIdentityGraphTests(unittest.TestCase):
             self.assertGreaterEqual(graph.observation_count, 10)
             self.assertEqual(graph.ue_nodes, 1)
             self.assertEqual(graph.access_context_nodes, 1)
-            self.assertEqual(graph.pdu_session_nodes, 1)
+            # The PFCP-side numeric session ID has no UE/access evidence and must
+            # not be globally merged with the NAS/NGAP session ID.
+            self.assertEqual(graph.pdu_session_nodes, 2)
             self.assertGreaterEqual(graph.pfcp_session_nodes, 1)
             self.assertGreater(graph.accepted_edges, 0)
             self.assertEqual(graph.conflicts, 0)
+
+    def test_malformed_jsonl_is_isolated_and_duplicate_headers_are_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "records.jsonl"
+            path.write_text('{"frame":1}\nnot-json\n[1,2]\n{"frame":2}\n', encoding="utf-8")
+            counters = {"warning_counts": defaultdict(int), "quarantined_count": 0}
+            issues: list[Issue] = []
+            records = list(_iter_jsonl_isolated(path, "NGAP", counters, issues))
+
+            self.assertEqual([record["frame"] for record in records], [1, 2])
+            self.assertEqual(counters["quarantined_count"], 2)
+            self.assertEqual(len(issues), 2)
+            headers = _normalized_headers([
+                {"name": "x-test", "value": "one", "frame": 1},
+                {"name": "x-test", "value": "two", "frame": 2},
+            ])
+            self.assertEqual([header["value"] for header in headers], ["one", "two"])
+
+    def test_release_mismatch_fails_before_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir)
+            decode_result = self._build_decoder_run(run_dir)
+            with self.assertRaisesRegex(ValueError, "release does not match"):
+                normalize_events(
+                    NormalizeEventsRequest(
+                        analysis_id=decode_result.analysis_id,
+                        decoder_result=decode_result,
+                        run_dir=run_dir,
+                        normalized_dir=run_dir / "normalized",
+                        indexes_dir=run_dir / "indexes",
+                        protocol_registry=ProtocolCodepointRegistry(
+                            registry_name="5g",
+                            registry_version="1",
+                            schema_version="2.0",
+                            sha256="registry",
+                            release="R16",
+                        ),
+                        partition_policy=ResolvedPolicy(name="partitions", version="1", sha256="partition", payload={}),
+                        config=NormalizationConfig(expected_release="R17"),
+                    )
+                )
+
+    def test_masking_keys_are_required_rotatable_and_unlinkable_across_runs(self) -> None:
+        policy = ResolvedPolicy(name="masking", version="1", sha256="masking", payload={})
+        first = BuildIdentityGraphRequest.model_construct(
+            analysis_id=UUID("20000000-0000-0000-0000-000000000001"),
+            masking_key=SecretStr("key-one"),
+            masking_policy=policy,
+        )
+        second = BuildIdentityGraphRequest.model_construct(
+            analysis_id=UUID("20000000-0000-0000-0000-000000000002"),
+            masking_key=SecretStr("key-one"),
+            masking_policy=policy,
+        )
+        rotated = BuildIdentityGraphRequest.model_construct(
+            analysis_id=first.analysis_id,
+            masking_key=SecretStr("key-two"),
+            masking_policy=policy,
+        )
+        missing = BuildIdentityGraphRequest.model_construct(
+            analysis_id=first.analysis_id,
+            masking_key=None,
+            masking_policy=policy,
+        )
+
+        self.assertNotEqual(_resolve_masking_key(first), _resolve_masking_key(second))
+        self.assertNotEqual(_resolve_masking_key(first), _resolve_masking_key(rotated))
+        with self.assertRaisesRegex(ValueError, "masking key material"):
+            _resolve_masking_key(missing)
+
+    def test_conflicting_subscriber_binding_is_recorded_and_access_scope_isolated(self) -> None:
+        analysis_id = UUID("20000000-0000-0000-0000-000000000003")
+        events = [
+            CanonicalEvent(
+                event_id=deterministic_uuid(analysis_id, "event", frame),
+                analysis_id=analysis_id,
+                protocol="NAS",
+                frame=frame,
+                timestamp=Decimal(frame),
+                timestamp_precision="seconds",
+                direction="UE_TO_NETWORK",
+                message_type="REGISTRATION_REQUEST",
+                outcome="request",
+                identifiers=EventIdentifiers(amf_ue_ngap_id="10", supi=supi),
+                src=Endpoint(ip=src),
+                dst=Endpoint(ip="192.0.2.10"),
+            )
+            for frame, supi, src in ((1, "imsi-001", "192.0.2.1"), (2, "imsi-002", "192.0.2.1"))
+        ]
+        observations: dict[UUID, list[IdentifierObservation]] = {}
+        for event in events:
+            scope = _scope_key(event, "amf_ue_ngap_id")
+            observations[event.event_id] = [
+                IdentifierObservation(
+                    observation_id=deterministic_uuid(event.event_id, "access"),
+                    event_id=event.event_id,
+                    frame=event.frame,
+                    timestamp=event.timestamp,
+                    timestamp_precision=event.timestamp_precision,
+                    kind="amf_ue_ngap_id",
+                    node_type="ACCESS_CONTEXT",
+                    lookup_value="10",
+                    sensitive=False,
+                    scope_key=scope,
+                    field_path="identifiers.amf_ue_ngap_id",
+                    role="ACCESS_CONTEXT",
+                    confidence=Decimal("1"),
+                    valid_from_frame=event.frame,
+                ),
+                IdentifierObservation(
+                    observation_id=deterministic_uuid(event.event_id, "ue"),
+                    event_id=event.event_id,
+                    frame=event.frame,
+                    timestamp=event.timestamp,
+                    timestamp_precision=event.timestamp_precision,
+                    kind="supi",
+                    node_type="UE",
+                    lookup_value=event.identifiers.supi or "",
+                    sensitive=True,
+                    scope_key="supi:subscriber",
+                    field_path="identifiers.supi",
+                    role="UE",
+                    confidence=Decimal("1"),
+                    valid_from_frame=event.frame,
+                ),
+            ]
+
+        counters = {"warning_counts": defaultdict(int)}
+        issues: list[Issue] = []
+        request = SimpleNamespace(analysis_id=analysis_id, normalization=SimpleNamespace(revision="identity-revision"))
+        conflicts = _detect_identifier_conflicts(request, observations, counters, issues)
+
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0].resolution, "unresolved")
+        isolated = events[1].model_copy(update={"src": Endpoint(ip="192.0.2.2")})
+        self.assertNotEqual(_scope_key(events[0], "amf_ue_ngap_id"), _scope_key(isolated, "amf_ue_ngap_id"))
 
     def _build_decoder_run(self, run_dir: Path) -> DecodeCaptureResult:
         source_dir = run_dir / "source"

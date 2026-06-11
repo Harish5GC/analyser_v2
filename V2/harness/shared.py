@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -92,6 +93,7 @@ class ProtocolCodepointRegistry(BaseModel):
     registry_version: str
     schema_version: str
     sha256: str
+    release: str | None = None
     nas_message_types: dict[str, str] = Field(default_factory=dict)
     nas_causes: dict[str, str] = Field(default_factory=dict)
     ngap_procedures: dict[str, str] = Field(default_factory=dict)
@@ -334,8 +336,23 @@ class ClosedArtifact:
         parent_source_sha256: str | None,
         revision: str | None = None,
     ) -> ArtifactDescriptor:
+        artifact_key = compact_json_bytes(
+            {
+                "creation_stage": creation_stage,
+                "relative_path": self.relative_path,
+                "artifact_type": self.artifact_type,
+                "protocol": self.protocol,
+                "media_type": self.media_type,
+                "format_schema_version": self.format_schema_version,
+                "sha256": self.sha256,
+                "byte_size": self.byte_size,
+                "record_count": self.record_count,
+                "parent_source_sha256": parent_source_sha256,
+                "revision": revision,
+            }
+        )
         return ArtifactDescriptor(
-            artifact_id=str(uuid4()),
+            artifact_id=f"artifact:{sha256_bytes(artifact_key)}",
             relative_path=self.relative_path,
             artifact_type=self.artifact_type,
             protocol=self.protocol,
@@ -422,7 +439,10 @@ class JsonArtifactWriter:
 
     def write(self, value: Any) -> ClosedArtifact:
         data = pretty_json_bytes(value)
-        self._path.write_bytes(data)
+        with self._path.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
         return ClosedArtifact(
             relative_path=self.relative_path,
             artifact_type=self.artifact_type,
@@ -445,11 +465,52 @@ def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
             yield json.loads(stripped)
 
 
+def reset_staging_directory(run_dir: Path, staging_root: Path) -> None:
+    validate_inside_run(run_dir, staging_root)
+    if staging_root.is_symlink():
+        raise ValueError(f"staging root {staging_root} must not be a symlink")
+    if staging_root.exists():
+        shutil.rmtree(staging_root)
+    staging_root.mkdir(parents=True, exist_ok=True)
+
+
+def fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _validate_publish_relative_path(relative_path: str) -> None:
+    candidate = Path(relative_path)
+    if candidate.is_absolute():
+        raise ValueError(f"absolute publish path is not allowed: {relative_path}")
+    if ".." in candidate.parts:
+        raise ValueError(f"relative publish path escapes the run directory: {relative_path}")
+
+
+def _ensure_safe_destination(run_dir: Path, destination: Path) -> None:
+    validate_inside_run(run_dir, destination)
+    current = destination
+    while True:
+        if current.exists() and current.is_symlink():
+            raise ValueError(f"destination path contains symlink: {current}")
+        if current == run_dir:
+            break
+        current = current.parent
+
+
 def publish_closed_artifacts(run_dir: Path, artifacts: Iterable[ClosedArtifact], *, manifest_relative_path: str | None = None) -> None:
     manifest_rel = manifest_relative_path
     normal: list[ClosedArtifact] = []
     manifest: list[ClosedArtifact] = []
+    seen_paths: set[str] = set()
     for artifact in artifacts:
+        _validate_publish_relative_path(artifact.relative_path)
+        if artifact.relative_path in seen_paths:
+            raise ValueError(f"duplicate publish path: {artifact.relative_path}")
+        seen_paths.add(artifact.relative_path)
         if manifest_rel is not None and artifact.relative_path == manifest_rel:
             manifest.append(artifact)
         else:
@@ -458,8 +519,18 @@ def publish_closed_artifacts(run_dir: Path, artifacts: Iterable[ClosedArtifact],
     for group in (sorted(normal, key=lambda item: item.relative_path), sorted(manifest, key=lambda item: item.relative_path)):
         for artifact in group:
             destination = run_dir / artifact.relative_path
+            _ensure_safe_destination(run_dir, destination)
             ensure_directory(destination.parent)
+            fsync_directory(destination.parent)
+            if destination.exists() and not destination.is_file():
+                raise ValueError(f"publish destination is not a regular file: {destination}")
             os.replace(artifact.staged_path, destination)
+            file_fd = os.open(destination, os.O_RDONLY)
+            try:
+                os.fsync(file_fd)
+            finally:
+                os.close(file_fd)
+            fsync_directory(destination.parent)
 
 
 def artifact_by_relative_path(artifacts: Iterable[ArtifactDescriptor], relative_path: str) -> ArtifactDescriptor | None:

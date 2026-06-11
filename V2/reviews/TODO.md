@@ -1,10 +1,15 @@
 # V2 Consolidated Review Todo
 
-This is the sole actionable review backlog for V2. It consolidates the accepted and valid portions of:
+This is the sole actionable contract/design review backlog for V2. It consolidates the accepted and valid portions of:
 
 - `REVIEW_FINDINGS.md`
 - `review_fable.md`
 - `ultra_review.md`
+
+Runtime implementation and release work discovered by reviewing the executable
+harness is tracked separately in `V2/reviews/APP_READINESS_TODO.md`. Contract
+items in this file are not evidence that the corresponding runtime behavior is
+complete.
 
 Items are deduplicated by implementation outcome. Review references identify the originating findings; they are not separate work items.
 

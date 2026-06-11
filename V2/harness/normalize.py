@@ -53,6 +53,7 @@ class NormalizationConfig(BaseModel):
     fail_on_unknown_schema_version: bool = True
     retain_routine_pfcp_heartbeats: bool = True
     fsync_outputs: bool = True
+    expected_release: str | None = None
 
 
 class NormalizeEventsRequest(BaseModel):
@@ -151,6 +152,64 @@ class _PendingEvent:
     source_record_type: str
 
 
+@dataclass
+class _StreamingIndexes:
+    frames: DefaultDict[int, list[str]]
+    times: list[dict[str, Any]]
+    protocols: DefaultDict[str, list[str]]
+    streams: DefaultDict[str, list[str]]
+    identifiers: DefaultDict[str, list[str]]
+    partitions: DefaultDict[str, list[dict[str, Any]]]
+    artifacts: list[dict[str, Any]]
+    event_frames: dict[str, int]
+
+    @classmethod
+    def create(cls) -> "_StreamingIndexes":
+        return cls(
+            frames=defaultdict(list),
+            times=[],
+            protocols=defaultdict(list),
+            streams=defaultdict(list),
+            identifiers=defaultdict(list),
+            partitions=defaultdict(list),
+            artifacts=[],
+            event_frames={},
+        )
+
+    def add(self, event: CanonicalEvent) -> None:
+        event_id = str(event.event_id)
+        self.event_frames[event_id] = event.frame
+        self.frames[event.frame].append(event_id)
+        self.times.append(
+            {
+                "event_id": event_id,
+                "timestamp": format(event.timestamp, "f") if event.timestamp is not None else None,
+                "frame": event.frame,
+            }
+        )
+        self.protocols[event.protocol].append(event_id)
+        stream_key = event.identifiers.http2_key or event.attributes.get("http.uri") or event.attributes.get("ngap.raw_procedure_code")
+        if stream_key:
+            self.streams[str(stream_key)].append(event_id)
+        for field_name, value in event.identifiers.model_dump(exclude_none=True).items():
+            self.identifiers[f"{field_name}:{value}"].append(event_id)
+        self.partitions[event.partition].append(
+            {
+                "event_id": event_id,
+                "frame": event.frame,
+                "message_type": event.message_type,
+            }
+        )
+        self.artifacts.append(
+            {
+                "event_id": event_id,
+                "partition": event.partition,
+                "validation_status": event.validation_status,
+                "raw_refs": [ref.model_dump(mode="json", exclude_none=True) for ref in event.raw_refs],
+            }
+        )
+
+
 def open_primary_event_reader(result: NormalizeEventsResult) -> JsonlPrimaryEventReader:
     primary_desc = artifact_by_relative_path(result.artifacts, "normalized/events/primary_events.jsonl")
     if primary_desc is None:
@@ -168,6 +227,7 @@ def normalize_events(request: NormalizeEventsRequest) -> NormalizeEventsResult:
     t01_manifest = validate_manifest(request.run_dir, request.decoder_result.manifest_path)
     validate_all_artifacts(request.run_dir, t01_manifest)
     _validate_decoder_lineage(request, t01_manifest)
+    _validate_decoder_artifact_schemas(t01_manifest)
 
     staging_root = request.run_dir / "staging" / f"T02-{request.analysis_id}"
     if staging_root.exists():
@@ -185,20 +245,18 @@ def normalize_events(request: NormalizeEventsRequest) -> NormalizeEventsResult:
 
     counters = _initial_counters()
     issues: list[Issue] = []
-    complete_events: list[CanonicalEvent] = []
-    primary_events: list[CanonicalEvent] = []
-    nrf_events: list[CanonicalEvent] = []
-    udr_events: list[CanonicalEvent] = []
+    indexes = _StreamingIndexes.create()
 
     seen_event_ids: set[UUID] = set()
     for pending in _iter_normalized_events(request, t01_manifest, counters, issues):
         event = _finalize_event(request, pending.event, pending.source_record_type)
+        _verify_source_refs(event, t01_manifest)
         if event.event_id in seen_event_ids:
             raise ValueError(f"duplicate event_id {event.event_id}")
         seen_event_ids.add(event.event_id)
 
-        complete_events.append(event)
         event_writer.write(event)
+        indexes.add(event)
         counters["event_count"] += 1
         counters["protocol_counts"][event.protocol] += 1
         if event.validation_status == "quarantined":
@@ -207,13 +265,10 @@ def normalize_events(request: NormalizeEventsRequest) -> NormalizeEventsResult:
 
         counters["partition_counts"][event.partition] += 1
         if event.partition == "primary":
-            primary_events.append(event)
             primary_writer.write(event)
         elif event.partition == "nrf":
-            nrf_events.append(event)
             nrf_writer.write(event)
         else:
-            udr_events.append(event)
             udr_writer.write(event)
 
     event_closed = event_writer.close()
@@ -221,14 +276,28 @@ def normalize_events(request: NormalizeEventsRequest) -> NormalizeEventsResult:
     nrf_closed = nrf_writer.close()
     udr_closed = udr_writer.close()
 
-    frame_index = _build_frame_index(complete_events)
-    time_index = _build_time_index(complete_events)
-    protocol_index = _build_protocol_index(complete_events)
-    stream_index = _build_stream_index(complete_events)
-    identifier_index = _build_identifier_index(complete_events)
-    nrf_index = _build_partition_index(nrf_events)
-    udr_index = _build_partition_index(udr_events)
-    artifact_index = _build_artifact_index(complete_events)
+    frame_index = [
+        {"frame": frame, "event_ids": sorted(event_ids)}
+        for frame, event_ids in sorted(indexes.frames.items())
+    ]
+    time_index = sorted(
+        indexes.times,
+        key=lambda item: (
+            item["timestamp"] is None,
+            Decimal(item["timestamp"]) if item["timestamp"] is not None else Decimal(0),
+            item["frame"],
+            item["event_id"],
+        ),
+    )
+    protocol_index = {protocol: sorted(event_ids) for protocol, event_ids in sorted(indexes.protocols.items())}
+    stream_index = {key: sorted(event_ids) for key, event_ids in sorted(indexes.streams.items())}
+    identifier_index = {key: sorted(event_ids) for key, event_ids in sorted(indexes.identifiers.items())}
+    nrf_index = sorted(indexes.partitions["nrf"], key=lambda item: (item["frame"], item["event_id"]))
+    udr_index = sorted(indexes.partitions["udr"], key=lambda item: (item["frame"], item["event_id"]))
+    artifact_index = sorted(
+        indexes.artifacts,
+        key=lambda item: (indexes.event_frames[item["event_id"]], item["event_id"]),
+    )
 
     frame_index_closed = JsonArtifactWriter(staging_root, request.run_dir, "indexes/frame_index.json", "event_index").write(frame_index)
     time_index_closed = JsonArtifactWriter(staging_root, request.run_dir, "indexes/time_index.json", "event_index").write(time_index)
@@ -393,12 +462,43 @@ def _validate_decoder_lineage(request: NormalizeEventsRequest, manifest: Decoder
         raise ValueError("decoder result source checksum does not match manifest source checksum")
     if request.protocol_registry.schema_version != SCHEMA_VERSION:
         raise ValueError(f"unsupported protocol registry schema_version {request.protocol_registry.schema_version!r}")
+    if request.config.expected_release is not None and request.protocol_registry.release != request.config.expected_release:
+        raise ValueError("protocol registry release does not match expected release")
     registry_version = request.policy_versions.get("protocol_registry")
     if registry_version is not None and registry_version != request.protocol_registry.registry_version:
         raise ValueError("protocol_registry policy version does not match registry_version")
     partition_version = request.policy_versions.get("partition_policy")
     if partition_version is not None and partition_version != request.partition_policy.version:
         raise ValueError("partition_policy policy version does not match resolved policy version")
+
+
+def _validate_decoder_artifact_schemas(manifest: DecoderManifest) -> None:
+    descriptors = [*manifest.artifacts]
+    for collection in manifest.collections:
+        descriptors.append(collection.index_artifact)
+        descriptors.extend(collection.members)
+    for descriptor in descriptors:
+        if descriptor.format_schema_version != SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported decoder artifact schema {descriptor.relative_path}: "
+                f"{descriptor.format_schema_version!r}"
+            )
+
+
+def _verify_source_refs(event: CanonicalEvent, manifest: DecoderManifest) -> None:
+    descriptors: dict[str, Any] = {item.relative_path: item for item in manifest.artifacts}
+    for collection in manifest.collections:
+        descriptors.update({item.relative_path: item for item in collection.members})
+    if not event.raw_refs:
+        raise ValueError(f"normalized event {event.event_id} has no source reference")
+    for source_ref in event.raw_refs:
+        descriptor = descriptors.get(source_ref.decoder_file)
+        if descriptor is None:
+            raise ValueError(f"source reference points to undeclared artifact {source_ref.decoder_file}")
+        if source_ref.artifact_sha256 != descriptor.sha256:
+            raise ValueError(f"source reference checksum mismatch for {source_ref.decoder_file}")
+        if source_ref.frame != event.frame:
+            raise ValueError(f"source reference frame mismatch for event {event.event_id}")
 
 
 def _iter_normalized_events(
@@ -415,8 +515,17 @@ def _iter_normalized_events(
         for member in sorted(collection.members, key=lambda item: item.relative_path):
             counters["source_record_counts"]["http2_stream"] += 1
             member_path = request.run_dir / member.relative_path
-            stream_doc = json.loads(member_path.read_text(encoding="utf-8"))
-            pending = _normalize_http2_document(request, collection, member, stream_doc)
+            try:
+                stream_doc = json.loads(member_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                _count_warning(counters, issues, Issue(code="T02_MALFORMED_HTTP2_DOCUMENT", stage="T02", message=f"{member.relative_path}: {exc}"))
+                counters["quarantined_count"] += 1
+                continue
+            if not isinstance(stream_doc, dict):
+                _count_warning(counters, issues, Issue(code="T02_INVALID_HTTP2_DOCUMENT", stage="T02", message=f"{member.relative_path}: document must be an object"))
+                counters["quarantined_count"] += 1
+                continue
+            pending = _normalize_http2_document(request, collection, member, stream_doc, counters, issues)
             if pending is not None:
                 yield pending
 
@@ -425,7 +534,7 @@ def _iter_normalized_events(
         None,
     )
     if ngap_desc is not None:
-        for record in iter_jsonl(request.run_dir / ngap_desc.relative_path):
+        for record in _iter_jsonl_isolated(request.run_dir / ngap_desc.relative_path, "NGAP", counters, issues):
             counters["source_record_counts"]["ngap_message"] += 1
             for pending in _normalize_ngap_record(request, ngap_desc, record, counters, issues):
                 yield pending
@@ -435,11 +544,82 @@ def _iter_normalized_events(
         None,
     )
     if pfcp_desc is not None:
-        for record in iter_jsonl(request.run_dir / pfcp_desc.relative_path):
+        for record in _iter_jsonl_isolated(request.run_dir / pfcp_desc.relative_path, "PFCP", counters, issues):
             counters["source_record_counts"]["pfcp_message"] += 1
             pending = _normalize_pfcp_record(request, pfcp_desc, record, counters, issues)
             if pending is not None:
                 yield pending
+
+
+def _iter_jsonl_isolated(
+    path: Path,
+    protocol: str,
+    counters: dict[str, Any],
+    issues: list[Issue],
+) -> Iterator[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                _count_warning(counters, issues, Issue(code=f"T02_MALFORMED_{protocol}_JSONL", stage="T02", message=f"{path.name}:{line_number}: {exc.msg}"))
+                counters["quarantined_count"] += 1
+                continue
+            if not isinstance(record, dict):
+                _count_warning(counters, issues, Issue(code=f"T02_INVALID_{protocol}_RECORD", stage="T02", message=f"{path.name}:{line_number}: record must be an object"))
+                counters["quarantined_count"] += 1
+                continue
+            yield record
+
+
+def _validate_source_schema(
+    request: NormalizeEventsRequest,
+    record: dict[str, Any],
+    protocol: str,
+    counters: dict[str, Any],
+    issues: list[Issue],
+) -> bool:
+    schema_version = record.get("schema_version")
+    if schema_version == SCHEMA_VERSION:
+        return True
+    message = f"{protocol} record schema_version {schema_version!r} is not supported"
+    if request.config.fail_on_unknown_schema_version:
+        raise ValueError(message)
+    _count_warning(counters, issues, Issue(code="T02_UNSUPPORTED_SOURCE_SCHEMA", stage="T02", message=message))
+    counters["quarantined_count"] += 1
+    return False
+
+
+def _optional_uuid(
+    value: Any,
+    counters: dict[str, Any],
+    issues: list[Issue],
+    protocol: str,
+) -> UUID | None:
+    if value in {None, ""}:
+        _count_warning(counters, issues, Issue(code="T02_MISSING_SOURCE_RECORD_ID", stage="T02", message=f"{protocol} source record has no record_id"))
+        return None
+    try:
+        return UUID(str(value))
+    except ValueError:
+        _count_warning(counters, issues, Issue(code="T02_INVALID_SOURCE_RECORD_ID", stage="T02", message=f"{protocol} source record_id is not a UUID"))
+        return None
+
+
+def _normalized_headers(headers: Any) -> list[dict[str, Any]]:
+    if not isinstance(headers, list):
+        return []
+    return [
+        {
+            "name": str(header.get("name", "")),
+            "value": header.get("value"),
+            "frame": header.get("frame"),
+        }
+        for header in headers
+        if isinstance(header, dict)
+    ]
 
 
 def _normalize_http2_document(
@@ -447,8 +627,12 @@ def _normalize_http2_document(
     collection: CollectionDescriptor,
     member: Any,
     doc: dict[str, Any],
+    counters: dict[str, Any],
+    issues: list[Issue],
 ) -> _PendingEvent | None:
     del collection
+    if not _validate_source_schema(request, doc, "HTTP2", counters, issues):
+        return None
     transport = doc.get("transport") or {}
     request_side = doc.get("request") or {}
     response_side = doc.get("response") or {}
@@ -509,6 +693,8 @@ def _normalize_http2_document(
             "http.status": status,
             "http.sbi_api": api,
             "http.completion_state": completion.get("state"),
+            "http.request_headers": _normalized_headers(request_headers),
+            "http.response_headers": _normalized_headers(response_headers),
             "http.request_body": body_summary or None,
             "http.response_body": response_body_summary or None,
         },
@@ -517,7 +703,7 @@ def _normalize_http2_document(
                 decoder_file=member.relative_path,
                 json_path="$",
                 frame=int(frame),
-                record_id=UUID(doc_id) if doc_id else None,
+                record_id=_optional_uuid(doc_id, counters, issues, "HTTP2") if doc_id else None,
                 artifact_sha256=member.sha256,
             )
         ],
@@ -532,6 +718,12 @@ def _normalize_ngap_record(
     counters: dict[str, Any],
     issues: list[Issue],
 ) -> Iterator[_PendingEvent]:
+    if not _validate_source_schema(request, record, "NGAP", counters, issues):
+        return
+    if record.get("frame") is None or not isinstance(record.get("ngap"), dict):
+        _count_warning(counters, issues, Issue(code="T02_INVALID_NGAP_RECORD", stage="T02", message="NGAP record lacks frame or NGAP object"))
+        counters["quarantined_count"] += 1
+        return
     ngap_tree = record.get("ngap")
     frame = int(record["frame"])
     identifiers = EventIdentifiers()
@@ -583,7 +775,7 @@ def _normalize_ngap_record(
                 decoder_file=descriptor.relative_path,
                 json_path="$",
                 frame=frame,
-                record_id=UUID(record["record_id"]),
+                record_id=_optional_uuid(record.get("record_id"), counters, issues, "NGAP"),
                 artifact_sha256=descriptor.sha256,
             )
         ],
@@ -674,7 +866,7 @@ def _normalize_nas_tree(
                 decoder_file=descriptor.relative_path,
                 json_path="$.nas",
                 frame=int(record["frame"]),
-                record_id=UUID(record["record_id"]),
+                record_id=_optional_uuid(record.get("record_id"), counters, issues, "NAS"),
                 artifact_sha256=descriptor.sha256,
             )
         ],
@@ -689,6 +881,12 @@ def _normalize_pfcp_record(
     counters: dict[str, Any],
     issues: list[Issue],
 ) -> _PendingEvent | None:
+    if not _validate_source_schema(request, record, "PFCP", counters, issues):
+        return None
+    if record.get("frame") is None or not isinstance(record.get("pfcp"), dict):
+        _count_warning(counters, issues, Issue(code="T02_INVALID_PFCP_RECORD", stage="T02", message="PFCP record lacks frame or PFCP object"))
+        counters["quarantined_count"] += 1
+        return None
     pfcp_tree = record.get("pfcp")
     raw_msg_type = str(record.get("msg_type")) if record.get("msg_type") is not None else None
     if raw_msg_type is not None:
@@ -755,7 +953,7 @@ def _normalize_pfcp_record(
                 decoder_file=descriptor.relative_path,
                 json_path="$",
                 frame=int(record["frame"]),
-                record_id=UUID(record["record_id"]),
+                record_id=_optional_uuid(record.get("record_id"), counters, issues, "PFCP"),
                 artifact_sha256=descriptor.sha256,
             )
         ],
